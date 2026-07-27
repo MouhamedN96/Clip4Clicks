@@ -10,6 +10,7 @@ const HermesIntegration = require('../integration/hermes');
 const ProductionPipeline = require('../production/pipeline');
 const HiggsfieldProducer = require('../production/higgsfield');
 const StockReelProducer = require('../production/stockreel');
+const ProductAdProducer = require('../production/productad');
 
 const config = {
     whop: {
@@ -25,6 +26,7 @@ const whop = new WhopIntegration(config.whop);
 const pipeline = new ProductionPipeline({ dataDir: process.env.CLIP_DATA_DIR || '/app/data' });
 const higgsfield = new HiggsfieldProducer({ dataDir: process.env.CLIP_DATA_DIR || '/app/data' });
 const stockReel = new StockReelProducer({ dataDir: process.env.CLIP_DATA_DIR || '/app/data' });
+const productAd = new ProductAdProducer({ dataDir: process.env.CLIP_DATA_DIR || '/app/data' });
 
 // Hermes farm is optional at boot: connect lazily only when a post job runs.
 const hermes = new HermesIntegration({
@@ -68,6 +70,7 @@ const queues = {
     clip: 'clip_queue',
     generate: 'generate_queue',
     reel: 'reel_queue',
+    productAd: 'product_ad_queue',
     post: 'post_queue',
     outreach: 'outreach_queue',
     analytics: 'analytics_queue',
@@ -225,6 +228,72 @@ async function processReelJob(job) {
     }
 }
 
+// Build a UTM query string for a product ad. {platform} is resolved per-platform
+// at post time (in processPostJob). Returns null when there's no store link.
+function buildUtm(job, clipId) {
+    if (!job.storeUrl) return null;
+    const slug = String(job.productSlug || job.productTitle || 'product')
+        .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
+    return `utm_source={platform}&utm_medium=organic&utm_campaign=${slug}&utm_content=${clipId}`;
+}
+
+// Process product-ad jobs (dropship path, product photo → Seedance ad).
+// Same 'pending_review' gate as every other producer. Approved ads post with
+// the store link (see the approve endpoint + processPostJob).
+async function processProductAdJob(job) {
+    console.log(`Processing product-ad job: ${(job.productTitle || '').slice(0, 60)} geo=${job.targetGeo || ''}`);
+
+    const client = await pool.connect();
+    let clipId;
+    try {
+        const inserted = await client.query(
+            `INSERT INTO clips (client_id, source_platform, title, status)
+             VALUES ($1, 'seedance', $2, 'processing') RETURNING id`,
+            [job.clientId || null,
+             job.productTitle ? `Ad: ${String(job.productTitle).slice(0, 60)}` : 'Product ad']
+        );
+        clipId = inserted.rows[0].id;
+    } finally {
+        client.release();
+    }
+
+    try {
+        const seg = await productAd.generateProductAd({ ...job, clipId });
+
+        if (!seg || seg.status === 'skipped' || !seg.path) {
+            await setClipStatus(clipId, 'failed', { error: seg && seg.reason ? seg.reason : 'no ad produced' });
+            return { clipId, status: 'failed', reason: seg && seg.reason };
+        }
+
+        await setClipStatus(clipId, 'pending_review', {
+            producedAt: new Date().toISOString(),
+            type: 'product_ad',
+            clipPath: seg.path,
+            provider: seg.provider || 'seedance',
+            model: seg.model,
+            captions: seg.captions || { status: 'n/a' },
+            product: {
+                title: job.productTitle || null,
+                price: job.price || null,
+                images: job.productImageUrls || (job.productImageUrl ? [job.productImageUrl] : []),
+                supplierUrl: job.supplierUrl || null
+            },
+            targetGeo: job.targetGeo || null,
+            targetLang: job.targetLang || null,
+            storeUrl: job.storeUrl || null,
+            utm: buildUtm(job, clipId),
+            platforms: job.platforms || ['tiktok', 'instagram']
+        });
+
+        console.log(`Product ad generated, awaiting review: ${clipId}`);
+        return { clipId, status: 'pending_review' };
+    } catch (error) {
+        console.error(`Product ad generation failed (${clipId}): ${error.message}`);
+        if (clipId) await setClipStatus(clipId, 'failed', { error: error.message });
+        return { clipId, status: 'failed', error: error.message };
+    }
+}
+
 // Update a clip's status + merge metadata.
 async function setClipStatus(clipId, status, metaPatch = {}) {
     const client = await pool.connect();
@@ -239,6 +308,16 @@ async function setClipStatus(clipId, status, metaPatch = {}) {
     } finally {
         client.release();
     }
+}
+
+// Append the store link (with per-platform UTM) to a caption, for product ads.
+// No-op when the job carries no storeUrl.
+function buildLinkedCaption(caption, job, platform) {
+    if (!job.storeUrl) return caption;
+    const sep = job.storeUrl.includes('?') ? '&' : '?';
+    const utm = job.utm ? sep + String(job.utm).replace(/\{platform\}/g, platform) : '';
+    const link = `${job.storeUrl}${utm}`;
+    return caption ? `${caption}\n\n🛒 ${link}` : link;
 }
 
 // Process posting jobs (approved clips → Hermes farm).
@@ -256,15 +335,16 @@ async function processPostJob(job) {
     for (const platform of platforms) {
         try {
             let result;
+            const linkedCaption = buildLinkedCaption(caption, job, platform);
             if (!live) {
                 result = { success: true, dryRun: true };
-                console.log(`[dry-run] would post ${clipPath} to ${platform}`);
+                console.log(`[dry-run] would post ${clipPath} to ${platform}${job.storeUrl ? ` (link: ${job.storeUrl})` : ''}`);
             } else {
                 const phone = hermes.getAvailablePhone(job.tier || 1);
                 if (!phone) throw new Error('no available phone in farm');
                 result = platform === 'instagram'
-                    ? await hermes.postInstagram(phone.id, clipPath, caption)
-                    : await hermes.postTikTok(phone.id, clipPath, caption);
+                    ? await hermes.postInstagram(phone.id, clipPath, linkedCaption)
+                    : await hermes.postTikTok(phone.id, clipPath, linkedCaption);
             }
             results.push({ platform, ...result });
         } catch (error) {
@@ -431,6 +511,7 @@ async function main() {
         runWorker(queues.clip, processClipJob),
         runWorker(queues.generate, processGenerateJob),
         runWorker(queues.reel, processReelJob),
+        runWorker(queues.productAd, processProductAdJob),
         runWorker(queues.post, processPostJob),
         runWorker(queues.outreach, processOutreachJob),
         runWorker(queues.onboarding, processOnboardingJob),

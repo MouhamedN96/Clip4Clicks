@@ -245,6 +245,30 @@ app.post('/api/reels/generate', async (req, res) => {
     }
 });
 
+// Product-ad generation (dropship path, product photo → Seedance). Lands in review queue.
+app.post('/api/productads/generate', async (req, res) => {
+    try {
+        const { clientId, productTitle, productImageUrl, productImageUrls, price,
+                targetGeo, targetLang, angle, storeUrl, supplierUrl, platforms } = req.body || {};
+        const images = productImageUrls || (productImageUrl ? [productImageUrl] : []);
+        if (!images.length) {
+            return res.status(400).json({ error: 'Provide productImageUrl or productImageUrls' });
+        }
+
+        await redis.lpush('product_ad_queue', JSON.stringify({
+            clientId, productTitle, productImageUrls: images, price,
+            targetGeo, targetLang, angle, storeUrl, supplierUrl,
+            platforms: platforms || ['tiktok', 'instagram'],
+            queuedAt: new Date().toISOString()
+        }));
+
+        res.json({ status: 'queued', message: 'Product-ad generation queued' });
+    } catch (error) {
+        console.error('Product-ad generation error:', error);
+        res.status(500).json({ error: 'Failed to queue product-ad generation' });
+    }
+});
+
 app.get('/api/clips/queue', async (req, res) => {
     try {
         const queueLength = await redis.llen('clip_queue');
@@ -318,6 +342,9 @@ app.post('/api/clips/:id/approve', async (req, res) => {
                 caption: caption || clip.title || '',
                 platforms: platforms || meta.platforms || ['tiktok'],
                 tier: tier || 1,
+                // Product ads post with the store link (with per-platform UTM).
+                storeUrl: meta.storeUrl || null,
+                utm: meta.utm || null,
                 queuedAt: new Date().toISOString()
             }));
 

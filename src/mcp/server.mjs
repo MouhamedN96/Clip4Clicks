@@ -72,6 +72,14 @@ tool('queue_specad', 'Queue a generative Higgsfield spec-ad from a brief or prod
       premium: z.boolean().optional(), platforms: z.array(z.string()).optional() },
     (a) => ({ method: 'POST', path: '/api/specads/generate', body: a }));
 
+tool('queue_product_ad', 'Queue a dropship product ad from a product photo (Seedance reference-to-video). Localized hook via DeepSeek; approved ads post with the store link + UTM.',
+    { clientId: z.string().optional(), productTitle: z.string().optional(),
+      productImageUrl: z.string().optional(), productImageUrls: z.array(z.string()).optional(),
+      price: z.string().optional(), targetGeo: z.string().optional(), targetLang: z.string().optional(),
+      angle: z.string().optional(), storeUrl: z.string().optional(), supplierUrl: z.string().optional(),
+      platforms: z.array(z.string()).optional() },
+    (a) => ({ method: 'POST', path: '/api/productads/generate', body: a }));
+
 // ---- clip review gate ----
 tool('review_queue', 'List clips awaiting human approval before posting.', {},
     () => ({ method: 'GET', path: '/api/clips/review-queue' }));
