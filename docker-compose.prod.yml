@@ -126,6 +126,14 @@ services:
 networks:
   clipforge-network:
     driver: bridge
+  # The host's reverse-proxy network (Traefik/Coolify). Declared EXTERNAL so
+  # compose attaches to it rather than trying to own it — without this block
+  # every `docker compose` call fails with "refers to undefined network",
+  # which also breaks the systemd auto-start on reboot.
+  # Create once on the box:  docker network create traefik-proxy
+  traefik-proxy:
+    external: true
+    name: ${TRAEFIK_NETWORK:-traefik-proxy}
 
 volumes:
   clipforge-postgres-data:
