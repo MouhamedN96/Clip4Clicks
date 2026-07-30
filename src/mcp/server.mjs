@@ -84,7 +84,7 @@ tool('queue_product_ad', 'Queue a dropship product ad from a product photo (Seed
 tool('review_queue', 'List clips awaiting human approval before posting.', {},
     () => ({ method: 'GET', path: '/api/clips/review-queue' }));
 
-tool('approve_clip', 'Approve a produced clip → queues it for posting via the Hermes farm (dry-run if no farm).',
+tool('approve_clip', 'Approve a produced clip → queues it for posting via Mobile-Use on a real device (dry-run if no Mobile-Use server).',
     { clipId: z.string(), platforms: z.array(z.string()).optional(), caption: z.string().optional(), tier: z.number().optional() },
     (a) => ({ method: 'POST', path: `/api/clips/${a.clipId}/approve`,
               body: { platforms: a.platforms, caption: a.caption, tier: a.tier } }));
@@ -105,13 +105,54 @@ tool('stage_outreach', 'Stage a DM draft (does NOT send) for human review.',
     { targetHandle: z.string(), targetPlatform: z.string().optional(), message: z.string(), clientId: z.string().optional() },
     (a) => ({ method: 'POST', path: '/api/outreach/send', body: a }));
 
-tool('approve_outreach', 'Approve a staged DM → queues it for the farm to send (dry-run if no farm). Optional edited text.',
+tool('approve_outreach', 'Approve a staged DM → queues it for Mobile-Use to send from a real device (dry-run if no Mobile-Use). Optional edited text.',
     { messageId: z.string(), message: z.string().optional(), tier: z.number().optional() },
     (a) => ({ method: 'POST', path: `/api/outreach/${a.messageId}/approve`, body: { message: a.message, tier: a.tier } }));
 
 tool('reject_outreach', 'Reject a staged DM so nothing sends. Records the reason.',
     { messageId: z.string(), reason: z.string().optional() },
     (a) => ({ method: 'POST', path: `/api/outreach/${a.messageId}/reject`, body: { reason: a.reason } }));
+
+// ---- Mobile-Use device + engagement tools ----
+tool('list_devices', 'List connected ADB devices via Mobile-Use (real Android phones on the desktop bridge).',
+    {},
+    () => ({ method: 'GET', path: '/api/devices' }));
+
+tool('device_status', 'Get the status of a specific Mobile-Use device.',
+    { deviceId: z.string() },
+    () => ({ method: 'GET', path: `/api/devices` }));  // list + client-side filter for now
+
+tool('post_clip', 'Queue an approved clip for posting via Mobile-Use. Same as approve_clip but with explicit device/platform.',
+    { clipId: z.string(), platforms: z.array(z.string()).optional(), caption: z.string().optional() },
+    (a) => ({ method: 'POST', path: `/api/clips/${a.clipId}/approve`,
+              body: { platforms: a.platforms, caption: a.caption } }));
+
+tool('scan_comments', 'Scan comments on a posted clip via Mobile-Use → keyword-match buying intent → propose replies + DMs (queued for human review).',
+    { clipId: z.string(), platform: z.string().optional(), deviceId: z.string().optional(), clipUrl: z.string().optional() },
+    (a) => ({ method: 'POST', path: `/api/posts/${a.clipId}/scan`,
+              body: { platform: a.platform, deviceId: a.deviceId, clipUrl: a.clipUrl } }));
+
+tool('reply_comment', 'Propose a reply to a specific comment (stages for human review, does NOT post).',
+    { clipId: z.string(), username: z.string(), text: z.string(), link: z.string().optional() },
+    (a) => ({ method: 'POST', path: `/api/posts/${a.clipId}/reply`,
+              body: { comment: { username: a.username, text: a.text }, link: a.link } }));
+
+tool('dm_commenter', 'Propose a DM to a commenter (stages for human review, does NOT send).',
+    { clipId: z.string(), username: z.string(), text: z.string(), link: z.string().optional() },
+    (a) => ({ method: 'POST', path: `/api/posts/${a.clipId}/dm`,
+              body: { comment: { username: a.username, text: a.text }, link: a.link } }));
+
+tool('engagement_queue', 'List pending engagement actions (replies + DMs awaiting human approval).',
+    {},
+    () => ({ method: 'GET', path: '/api/engagement/queue' }));
+
+tool('approve_engagement', 'Approve a pending engagement reply/DM → Mobile-Use executes on device.',
+    { id: z.string(), clipId: z.string() },
+    (a) => ({ method: 'POST', path: `/api/engagement/${a.id}/approve`, body: { clipId: a.clipId } }));
+
+tool('reject_engagement', 'Reject a pending engagement reply/DM.',
+    { id: z.string(), clipId: z.string(), reason: z.string().optional() },
+    (a) => ({ method: 'POST', path: `/api/engagement/${a.id}/reject`, body: { clipId: a.clipId, reason: a.reason } }));
 
 // ---- overview ----
 tool('list_clients', 'List active clients.', {},

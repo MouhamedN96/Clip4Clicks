@@ -6,11 +6,13 @@
 const { Pool } = require('pg');
 const Redis = require('ioredis');
 const WhopIntegration = require('../integration/whop');
-const HermesIntegration = require('../integration/hermes');
+const mobileuse = require('../integration/mobileuse');
 const ProductionPipeline = require('../production/pipeline');
 const HiggsfieldProducer = require('../production/higgsfield');
 const StockReelProducer = require('../production/stockreel');
 const ProductAdProducer = require('../production/productad');
+const PostingProducer = require('../production/posting');
+const EngagementProducer = require('../production/engagement');
 
 const config = {
     whop: {
@@ -28,26 +30,29 @@ const higgsfield = new HiggsfieldProducer({ dataDir: process.env.CLIP_DATA_DIR |
 const stockReel = new StockReelProducer({ dataDir: process.env.CLIP_DATA_DIR || '/app/data' });
 const productAd = new ProductAdProducer({ dataDir: process.env.CLIP_DATA_DIR || '/app/data' });
 
-// Hermes farm is optional at boot: connect lazily only when a post job runs.
-const hermes = new HermesIntegration({
-    relayUrl: process.env.HERMES_RELAY_URL,
-    apiKey: process.env.HERMES_API_KEY,
-    phoneCount: parseInt(process.env.HERMES_PHONE_COUNT) || 48,
-    timeout: parseInt(process.env.HERMES_CONNECTION_TIMEOUT) || 30000
-});
-let hermesReady = false;
+const posting = new PostingProducer();
+const engagement = new EngagementProducer();
 
-async function ensureHermes() {
-    if (hermesReady) return true;
-    if (!process.env.HERMES_RELAY_URL) return false; // farm not configured → dry-run
-    try {
-        await hermes.connect();
-        hermesReady = true;
-        return true;
-    } catch (error) {
-        console.error(`Hermes connect failed, posting in dry-run: ${error.message}`);
-        return false;
+// Mobile-Use is optional at boot: check lazily only when a post/engagement job runs.
+let mobileuseReady = false;
+let mobileuseChecked = false;
+
+async function ensureMobileUse() {
+    if (mobileuseReady) return true;
+    if (mobileuseChecked && !mobileuse.isConfigured()) return false;
+    if (!mobileuse.isConfigured()) {
+        mobileuseChecked = true;
+        return false; // Mobile-Use not configured → dry-run
     }
+    const alive = await mobileuse.isAlive();
+    if (alive) {
+        mobileuseReady = true;
+        console.log('Mobile-Use: server reachable');
+    } else {
+        console.log('Mobile-Use: server not reachable, posting in dry-run');
+    }
+    mobileuseChecked = true;
+    return alive;
 }
 
 const pool = new Pool({
@@ -73,6 +78,7 @@ const queues = {
     productAd: 'product_ad_queue',
     post: 'post_queue',
     outreach: 'outreach_queue',
+    engagement: 'engagement_queue',
     analytics: 'analytics_queue',
     onboarding: 'onboarding_queue'
 };
@@ -320,7 +326,7 @@ function buildLinkedCaption(caption, job, platform) {
     return caption ? `${caption}\n\n🛒 ${link}` : link;
 }
 
-// Process posting jobs (approved clips → Hermes farm).
+// Process posting jobs (approved clips → Mobile-Use posts on real devices).
 // Enqueued by the approval endpoint, never automatically.
 async function processPostJob(job) {
     console.log(`Processing post job: clip=${job.clipId} platforms=${(job.platforms || []).join(',')}`);
@@ -329,7 +335,7 @@ async function processPostJob(job) {
     const caption = job.caption || job.title || '';
     const platforms = job.platforms && job.platforms.length ? job.platforms : ['tiktok'];
 
-    const live = await ensureHermes();
+    const live = await ensureMobileUse();
     const results = [];
 
     for (const platform of platforms) {
@@ -340,11 +346,19 @@ async function processPostJob(job) {
                 result = { success: true, dryRun: true };
                 console.log(`[dry-run] would post ${clipPath} to ${platform}${job.storeUrl ? ` (link: ${job.storeUrl})` : ''}`);
             } else {
-                const phone = hermes.getAvailablePhone(job.tier || 1);
-                if (!phone) throw new Error('no available phone in farm');
-                result = platform === 'instagram'
-                    ? await hermes.postInstagram(phone.id, clipPath, linkedCaption)
-                    : await hermes.postTikTok(phone.id, clipPath, linkedCaption);
+                // Pick a device for this platform
+                const deviceId = await mobileuse.pickDevice(platform);
+                if (!deviceId) {
+                    throw new Error(`no device available for ${platform}`);
+                }
+                result = await posting.postClip({
+                    clipId: job.clipId,
+                    clipPath,
+                    caption: linkedCaption,
+                    platform,
+                    deviceId,
+                    mobileuse
+                });
             }
             results.push({ platform, ...result });
         } catch (error) {
@@ -375,23 +389,29 @@ async function processPostJob(job) {
     return { clipId: job.clipId, results };
 }
 
-// Process outreach jobs (human-APPROVED DMs → Hermes farm).
-// Only reaches here after /api/outreach/:id/approve. Dry-runs without a farm.
+// Process outreach jobs (human-APPROVED DMs → Mobile-Use sends from real device).
+// Only reaches here after /api/outreach/:id/approve. Dry-runs without Mobile-Use.
 async function processOutreachJob(job) {
     console.log(`Processing outreach job: ${job.targetHandle} (${job.targetPlatform})`);
 
-    const live = await ensureHermes();
+    const live = await ensureMobileUse();
     let result;
     try {
         if (!live) {
             result = { success: true, dryRun: true };
             console.log(`[dry-run] would DM ${job.targetHandle} on ${job.targetPlatform}`);
         } else {
-            const phone = hermes.getAvailablePhone(job.tier || 1);
-            if (!phone) throw new Error('no available phone in farm');
-            result = job.targetPlatform === 'instagram'
-                ? await hermes.sendInstagramDM(phone.id, job.targetHandle, job.message)
-                : await hermes.sendTikTokDM(phone.id, job.targetHandle, job.message);
+            const platform = String(job.targetPlatform || 'tiktok').toLowerCase();
+            const deviceId = await mobileuse.pickDevice(platform);
+            if (!deviceId) throw new Error('no device available for outreach');
+            // Use engagement producer's DM executor (handles rate limiting)
+            result = await engagement.executeDM({
+                deviceId,
+                platform,
+                targetUsername: job.targetHandle,
+                dmText: job.message,
+                mobileuse
+            });
         }
     } catch (error) {
         console.error(`Outreach send failed (${job.targetHandle}): ${error.message}`);
@@ -427,6 +447,72 @@ async function processOutreachJob(job) {
 
     console.log(`Outreach ${result.success ? 'sent' : 'failed'}: ${job.targetHandle}`);
     return { targetHandle: job.targetHandle, ...result };
+}
+
+// Process engagement jobs (scan comments → propose replies/DMs → human gate).
+// Scans comments on a posted clip, keyword-matches buying intent, proposes
+// replies + DMs. Proposals land in the engagement review queue for human
+// approval (stored in clips.metadata.engagement). Degrades gracefully.
+async function processEngagementJob(job) {
+    console.log(`Processing engagement job: clip=${job.clipId} platform=${job.platform || 'tiktok'}`);
+
+    const live = await ensureMobileUse();
+    if (!live) {
+        console.log(`[dry-run] Mobile-Use not reachable, skipping engagement scan`);
+        return { clipId: job.clipId, status: 'skipped', reason: 'mobileuse_not_alive' };
+    }
+
+    try {
+        const deviceId = job.deviceId || await mobileuse.pickDevice(job.platform || 'tiktok');
+        if (!deviceId) {
+            return { clipId: job.clipId, status: 'skipped', reason: 'no_device' };
+        }
+
+        const scanResult = await engagement.scanAndPropose({
+            deviceId,
+            platform: job.platform || 'tiktok',
+            clipUrl: job.clipUrl || null,
+            clipId: job.clipId,
+            link: job.link || job.storeUrl || null,
+            mobileuse
+        });
+
+        if (!scanResult) {
+            return { clipId: job.clipId, status: 'skipped', reason: 'scan_failed' };
+        }
+
+        // Store proposed engagement actions in clips.metadata for human review.
+        // The API engagement endpoints read from here.
+        if (scanResult.proposals.length > 0) {
+            const dbClient = await pool.connect();
+            try {
+                const existing = await dbClient.query(
+                    'SELECT metadata FROM clips WHERE id = $1', [job.clipId]
+                );
+                const meta = existing.rows[0]?.metadata || {};
+                const prevEngagement = meta.engagement || { pending: [] };
+                prevEngagement.pending = [...(prevEngagement.pending || []), ...scanResult.proposals];
+                await dbClient.query(
+                    `UPDATE clips SET metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb WHERE id = $2`,
+                    [JSON.stringify({ engagement: prevEngagement }), job.clipId]
+                );
+            } finally {
+                dbClient.release();
+            }
+        }
+
+        console.log(`Engagement scan: ${scanResult.comments.length} comments, ${scanResult.matched.length} matched, ${scanResult.proposals.length} proposed`);
+        return {
+            clipId: job.clipId,
+            status: 'scanned',
+            commentsFound: scanResult.comments.length,
+            matched: scanResult.matched.length,
+            proposed: scanResult.proposals.length
+        };
+    } catch (error) {
+        console.error(`Engagement scan failed (${job.clipId}): ${error.message}`);
+        return { clipId: job.clipId, status: 'failed', error: error.message };
+    }
 }
 
 // Process onboarding jobs
@@ -514,6 +600,7 @@ async function main() {
         runWorker(queues.productAd, processProductAdJob),
         runWorker(queues.post, processPostJob),
         runWorker(queues.outreach, processOutreachJob),
+        runWorker(queues.engagement, processEngagementJob),
         runWorker(queues.onboarding, processOnboardingJob),
         runWorker(queues.analytics, processAnalyticsJob)
     ]);

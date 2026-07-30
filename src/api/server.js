@@ -10,6 +10,8 @@ const morgan = require('morgan');
 const { Pool } = require('pg');
 const Redis = require('ioredis');
 const WhopIntegration = require('../integration/whop');
+const mobileuse = require('../integration/mobileuse');
+const engagementProducer = require('../production/engagement');
 
 const app = express();
 
@@ -548,6 +550,304 @@ app.get('/api/outreach/analytics', async (req, res) => {
     } catch (error) {
         console.error('Analytics error:', error);
         res.status(500).json({ error: 'Failed to fetch analytics' });
+    }
+});
+
+// ============================================
+// MOBILE-USE DEVICE & ENGAGEMENT ENDPOINTS
+// ============================================
+
+// List connected ADB devices via Mobile-Use.
+app.get('/api/devices', async (req, res) => {
+    try {
+        const devices = await mobileuse.listDevices();
+        if (devices === null) {
+            return res.json({ devices: [], reachable: false, message: 'Mobile-Use server not reachable' });
+        }
+        res.json({ devices, reachable: true, count: devices.length });
+    } catch (error) {
+        console.error('Device list error:', error);
+        res.status(500).json({ error: 'Failed to list devices' });
+    }
+});
+
+// Fetch comments on a posted clip via Mobile-Use.
+app.post('/api/posts/:clipId/comments', async (req, res) => {
+    try {
+        const { deviceId, platform, clipUrl } = req.body || {};
+        if (!deviceId) {
+            return res.status(400).json({ error: 'deviceId required' });
+        }
+
+        const comments = await engagementProducer.scanComments({
+            deviceId,
+            platform: platform || 'tiktok',
+            clipUrl,
+            mobileuse
+        });
+
+        if (comments === null) {
+            return res.json({ comments: [], reachable: false, message: 'Mobile-Use server not reachable' });
+        }
+        res.json({ comments, count: comments.length, reachable: true });
+    } catch (error) {
+        console.error('Comment fetch error:', error);
+        res.status(500).json({ error: 'Failed to fetch comments' });
+    }
+});
+
+// Scan comments + propose replies/DMs (keyword match). Queues an engagement job.
+app.post('/api/posts/:clipId/scan', async (req, res) => {
+    try {
+        const { platform, deviceId, clipUrl, link } = req.body || {};
+
+        // Look up clip metadata for link if not provided
+        let storeLink = link;
+        let plat = platform || 'tiktok';
+        const dbClient = await pool.connect();
+        try {
+            const result = await dbClient.query('SELECT metadata FROM clips WHERE id = $1', [req.params.clipId]);
+            if (result.rows.length > 0) {
+                const meta = result.rows[0].metadata || {};
+                if (!storeLink) storeLink = meta.storeUrl || null;
+                if (!platform) plat = (meta.platforms_posted || meta.platforms || ['tiktok'])[0];
+            }
+        } finally {
+            dbClient.release();
+        }
+
+        await redis.lpush('engagement_queue', JSON.stringify({
+            clipId: req.params.clipId,
+            platform: plat,
+            deviceId: deviceId || null,
+            clipUrl: clipUrl || null,
+            link: storeLink,
+            queuedAt: new Date().toISOString()
+        }));
+
+        res.json({ status: 'queued', clipId: req.params.clipId, message: 'Engagement scan queued' });
+    } catch (error) {
+        console.error('Engagement scan queue error:', error);
+        res.status(500).json({ error: 'Failed to queue engagement scan' });
+    }
+});
+
+// Propose a reply to a comment (stages for human review, does NOT post).
+app.post('/api/posts/:clipId/reply', async (req, res) => {
+    try {
+        const { comment, link } = req.body || {};
+        if (!comment || !comment.username || !comment.text) {
+            return res.status(400).json({ error: 'comment with username+text required' });
+        }
+
+        const proposal = engagementProducer.proposeReply(comment, { link });
+
+        // Store in clip metadata
+        const dbClient = await pool.connect();
+        try {
+            const result = await dbClient.query('SELECT metadata FROM clips WHERE id = $1', [req.params.clipId]);
+            if (result.rows.length === 0) {
+                return res.status(404).json({ error: 'Clip not found' });
+            }
+            const meta = result.rows[0].metadata || {};
+            const eng = meta.engagement || { pending: [] };
+            eng.pending = [...(eng.pending || []), {
+                clipId: req.params.clipId,
+                comment,
+                replyText: proposal.replyText,
+                type: 'reply',
+                status: 'pending_review',
+                createdAt: new Date().toISOString()
+            }];
+            await dbClient.query(
+                `UPDATE clips SET metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb WHERE id = $2`,
+                [JSON.stringify({ engagement: eng }), req.params.clipId]
+            );
+        } finally {
+            dbClient.release();
+        }
+
+        res.json({ status: 'pending_review', proposal: proposal.replyText });
+    } catch (error) {
+        console.error('Reply proposal error:', error);
+        res.status(500).json({ error: 'Failed to propose reply' });
+    }
+});
+
+// Propose a DM to a commenter (stages for human review, does NOT send).
+app.post('/api/posts/:clipId/dm', async (req, res) => {
+    try {
+        const { comment, link } = req.body || {};
+        if (!comment || !comment.username || !comment.text) {
+            return res.status(400).json({ error: 'comment with username+text required' });
+        }
+
+        const proposal = engagementProducer.proposeDM(comment, { link });
+
+        // Store in clip metadata
+        const dbClient = await pool.connect();
+        try {
+            const result = await dbClient.query('SELECT metadata FROM clips WHERE id = $1', [req.params.clipId]);
+            if (result.rows.length === 0) {
+                return res.status(404).json({ error: 'Clip not found' });
+            }
+            const meta = result.rows[0].metadata || {};
+            const eng = meta.engagement || { pending: [] };
+            eng.pending = [...(eng.pending || []), {
+                clipId: req.params.clipId,
+                comment,
+                dmText: proposal.dmText,
+                link: proposal.link,
+                type: 'dm',
+                status: 'pending_review',
+                createdAt: new Date().toISOString()
+            }];
+            await dbClient.query(
+                `UPDATE clips SET metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb WHERE id = $2`,
+                [JSON.stringify({ engagement: eng }), req.params.clipId]
+            );
+        } finally {
+            dbClient.release();
+        }
+
+        res.json({ status: 'pending_review', proposal: proposal.dmText });
+    } catch (error) {
+        console.error('DM proposal error:', error);
+        res.status(500).json({ error: 'Failed to propose DM' });
+    }
+});
+
+// List pending engagement actions (replies + DMs awaiting approval).
+app.get('/api/engagement/queue', async (req, res) => {
+    try {
+        const dbClient = await pool.connect();
+        try {
+            const result = await dbClient.query(
+                `SELECT id, metadata->'engagement' as engagement FROM clips
+                 WHERE metadata->'engagement'->'pending' IS NOT NULL
+                 ORDER BY created_at DESC`
+            );
+            const pending = [];
+            for (const row of result.rows) {
+                const eng = row.engagement || {};
+                for (const item of (eng.pending || [])) {
+                    if (item.status === 'pending_review') {
+                        pending.push({ clipId: row.id, ...item });
+                    }
+                }
+            }
+            res.json({ count: pending.length, pending });
+        } finally {
+            dbClient.release();
+        }
+    } catch (error) {
+        console.error('Engagement queue error:', error);
+        res.status(500).json({ error: 'Failed to fetch engagement queue' });
+    }
+});
+
+// Approve a pending engagement action (reply or DM) → Mobile-Use executes.
+app.post('/api/engagement/:id/approve', async (req, res) => {
+    try {
+        const { clipId } = req.body || {};
+        if (!clipId) {
+            return res.status(400).json({ error: 'clipId required' });
+        }
+
+        const dbClient = await pool.connect();
+        try {
+            const result = await dbClient.query('SELECT metadata FROM clips WHERE id = $1', [clipId]);
+            if (result.rows.length === 0) {
+                return res.status(404).json({ error: 'Clip not found' });
+            }
+            const meta = result.rows[0].metadata || {};
+            const eng = meta.engagement || { pending: [] };
+            const item = (eng.pending || []).find(p => (p.id || p.createdAt) === req.params.id && p.status === 'pending_review');
+            if (!item) {
+                return res.status(404).json({ error: 'Engagement action not found or not pending' });
+            }
+
+            // Mark as approved
+            item.status = 'approved';
+            item.approvedAt = new Date().toISOString();
+            await dbClient.query(
+                `UPDATE clips SET metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb WHERE id = $2`,
+                [JSON.stringify({ engagement: eng }), clipId]
+            );
+
+            // Queue for execution via outreach_queue (DM) or direct Mobile-Use (reply)
+            if (item.type === 'dm') {
+                await redis.lpush('outreach_queue', JSON.stringify({
+                    messageId: null,
+                    targetHandle: item.comment.username,
+                    targetPlatform: item.platform || 'tiktok',
+                    message: item.dmText,
+                    clientId: null,
+                    queuedAt: new Date().toISOString()
+                }));
+            } else {
+                // Reply: execute directly via Mobile-Use (or dry-run)
+                const alive = await mobileuse.isAlive();
+                if (alive) {
+                    const deviceId = await mobileuse.pickDevice(item.platform || 'tiktok');
+                    if (deviceId) {
+                        await engagementProducer.executeReply({
+                            deviceId,
+                            platform: item.platform || 'tiktok',
+                            comment: item.comment,
+                            replyText: item.replyText,
+                            mobileuse
+                        });
+                    }
+                }
+            }
+
+            res.json({ status: 'approved', id: req.params.id, clipId });
+        } finally {
+            dbClient.release();
+        }
+    } catch (error) {
+        console.error('Engagement approve error:', error);
+        res.status(500).json({ error: 'Failed to approve engagement action' });
+    }
+});
+
+// Reject a pending engagement action.
+app.post('/api/engagement/:id/reject', async (req, res) => {
+    try {
+        const { clipId, reason } = req.body || {};
+        if (!clipId) {
+            return res.status(400).json({ error: 'clipId required' });
+        }
+
+        const dbClient = await pool.connect();
+        try {
+            const result = await dbClient.query('SELECT metadata FROM clips WHERE id = $1', [clipId]);
+            if (result.rows.length === 0) {
+                return res.status(404).json({ error: 'Clip not found' });
+            }
+            const meta = result.rows[0].metadata || {};
+            const eng = meta.engagement || { pending: [] };
+            const item = (eng.pending || []).find(p => (p.id || p.createdAt) === req.params.id && p.status === 'pending_review');
+            if (!item) {
+                return res.status(404).json({ error: 'Engagement action not found or not pending' });
+            }
+
+            item.status = 'rejected';
+            item.rejectedAt = new Date().toISOString();
+            item.rejectReason = reason || null;
+            await dbClient.query(
+                `UPDATE clips SET metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb WHERE id = $2`,
+                [JSON.stringify({ engagement: eng }), clipId]
+            );
+
+            res.json({ status: 'rejected', id: req.params.id, clipId });
+        } finally {
+            dbClient.release();
+        }
+    } catch (error) {
+        console.error('Engagement reject error:', error);
+        res.status(500).json({ error: 'Failed to reject engagement action' });
     }
 });
 
