@@ -9,6 +9,7 @@ const helmet = require('helmet');
 const morgan = require('morgan');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { Pool } = require('pg');
 const Redis = require('ioredis');
 const WhopIntegration = require('../integration/whop');
@@ -856,6 +857,26 @@ app.post('/api/engagement/:id/reject', async (req, res) => {
 // ============================================
 // DESKTOP BRIDGE (Mobile-Use runs on the operator's laptop, not the VPS)
 // ============================================
+// AUTH: these routes claim (destructively pop) jobs, stream produced media, and
+// mark clips posted, and the desktop reaches them over the tailnet / a Traefik
+// route — not localhost. So they require a shared secret. Fails CLOSED: with no
+// BRIDGE_TOKEN/API_SECRET configured, the bridge is disabled rather than open.
+function requireBridgeAuth(req, res, next) {
+    const expected = process.env.BRIDGE_TOKEN || process.env.API_SECRET || '';
+    if (!expected) {
+        return res.status(503).json({ error: 'Bridge disabled: set BRIDGE_TOKEN (or API_SECRET)' });
+    }
+    const header = req.headers.authorization || '';
+    const provided = header.startsWith('Bearer ') ? header.slice(7) : header;
+    const a = Buffer.from(provided);
+    const b = Buffer.from(expected);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    next();
+}
+app.use('/api/bridge', requireBridgeAuth);
+
 // The VPS produces + gates; it cannot touch phones. The Tauri desktop app runs
 // Mobile-Use locally and CLAIMS device jobs here, executes them on real phones,
 // downloads the clip file, and REPORTS results back. Enabled by POST_EXECUTOR=desktop
