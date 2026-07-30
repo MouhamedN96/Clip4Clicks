@@ -140,6 +140,26 @@
   #toast b{color:var(--accent)}
 
   .btn-approve:disabled,.btn:disabled{opacity:.5; cursor:default}
+
+  /* bridge */
+  .pillrow{display:flex; gap:.6rem; flex-wrap:wrap; align-items:center; margin-top:.9rem}
+  .pill{display:inline-flex; align-items:center; gap:.45rem; background:var(--panel-2); border:1px solid var(--line);
+    border-radius:20px; padding:.32rem .75rem; font-family:var(--font-mono); font-size:.72rem; color:var(--muted)}
+  .pill.live{color:var(--text); border-color:color-mix(in srgb,var(--good) 40%,var(--line))}
+  .btnrow{display:flex; gap:.6rem; flex-wrap:wrap; margin-top:1.2rem}
+  .cardhead{display:flex; align-items:center; justify-content:space-between; gap:.8rem}
+  .devrow{display:flex; align-items:center; gap:.9rem; padding:.65rem 0; border-top:1px solid var(--line)}
+  .devrow:first-child{border-top:0}
+  .devrow .did{font-family:var(--font-mono); font-size:.8rem; color:var(--text)}
+  .devrow .dmodel{flex:1; min-width:0; font-size:.88rem; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+  .log{margin-top:.7rem; height:260px; overflow-y:auto; background:var(--ink); border:1px solid var(--line); border-radius:6px;
+    padding:.6rem .7rem; font-family:var(--font-mono); font-size:.72rem; line-height:1.7}
+  .log .ln{display:flex; gap:.6rem; white-space:pre-wrap; word-break:break-word; color:var(--muted)}
+  .log .ln .t{color:var(--faint); flex:0 0 auto}
+  .log .ln.err{color:var(--warn)}
+  .log .none{color:var(--faint)}
+  @media (pointer:coarse){ #sec-bridge .btn{min-height:44px} }
+  @media (prefers-reduced-motion:reduce){ #sec-bridge *{transition:none !important; animation:none !important} }
 </style>
 </head>
 <body>
@@ -155,6 +175,10 @@
       <button class="navbtn" data-sec="produce" type="button">
         <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
         Produce
+      </button>
+      <button class="navbtn" data-sec="bridge" type="button">
+        <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="2" width="12" height="20" rx="2"/><path d="M11 18h2"/><path d="M2 9h2"/><path d="M20 9h2"/></svg>
+        Bridge <span class="badge" id="bBridge">0</span>
       </button>
       <button class="navbtn" data-sec="analytics" type="button">
         <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><rect x="7" y="10" width="3" height="7"/><rect x="12" y="6" width="3" height="11"/><rect x="17" y="13" width="3" height="4"/></svg>
@@ -211,6 +235,38 @@
         </div>
       </section>
 
+      <!-- BRIDGE -->
+      <section class="section" id="sec-bridge">
+        <div class="card">
+          <span class="lbl">Bridge status</span>
+          <div class="pillrow">
+            <span class="pill" id="brStatePill"><span class="dot" id="brDot"></span><span id="brState">Stopped</span></span>
+            <span class="pill" id="brMuPill"><span class="dot" id="brMuDot"></span><span id="brMuState">Mobile-Use · unknown</span></span>
+            <span class="pill" id="brPollPill">last poll · never</span>
+          </div>
+          <div class="btnrow">
+            <button class="btn btn-primary" id="brStart" type="button">Start bridge</button>
+            <button class="btn btn-ghost" id="brStop" type="button">Stop bridge</button>
+            <button class="btn btn-ghost" id="brTick" type="button">Run one job</button>
+          </div>
+        </div>
+        <div class="stats" style="margin-top:1.2rem">
+          <div class="stat"><div class="n" id="brDone">—</div><div class="l">Jobs done</div></div>
+          <div class="stat"><div class="n acc" id="brFailed">—</div><div class="l">Jobs failed</div></div>
+        </div>
+        <div class="card" style="margin-top:1.2rem">
+          <div class="cardhead">
+            <span class="lbl">Phones on this machine</span>
+            <button class="btn btn-ghost" id="brDevRefresh" type="button" style="padding:.4rem .7rem">Refresh devices</button>
+          </div>
+          <div id="brDevList" style="margin-top:.6rem"></div>
+        </div>
+        <div class="card">
+          <span class="lbl">Live log</span>
+          <div class="log" id="brLog" role="log" aria-live="polite" tabindex="0"></div>
+        </div>
+      </section>
+
       <!-- ANALYTICS -->
       <section class="section" id="sec-analytics">
         <div class="stats" id="statGrid"></div>
@@ -257,6 +313,7 @@
   var _invoke = (T && T.core && typeof T.core.invoke==="function") ? T.core.invoke.bind(T.core)
               : (T && typeof T.invoke==="function") ? T.invoke.bind(T) : null;
   var LIVE = !!_invoke;
+  var _listen = (T && T.event && typeof T.event.listen==="function") ? T.event.listen.bind(T.event) : null;
   var $ = function(id){return document.getElementById(id);};
 
   // ---- mock backend (preview / no-Tauri) ----
@@ -270,8 +327,20 @@
     posted:[{id:"c5", title:"The road that doesn't end", source_url:"https://youtube.com/watch?v=q", status:"posted", duration:22, platforms:["tiktok","youtube"], created_at:"2026-07-20"}]
   };
   var mockSettings = {vps_url:"http://100.121.164.39:3000", api_key:"", brand_name:"Clip4Clicks", render_local:true, auto_sync:true};
+  var mockBridge = {running:false, last_poll:null, jobs_done:14, jobs_failed:2, mobileuse_alive:true};
+  var mockDevices = [
+    {id:"39021FDH2000AB", model:"Pixel 6a", status:"idle"},
+    {id:"R58N70QK1PY", model:"Galaxy A54", status:"posting"}
+  ];
   function mock(cmd,args){
     switch(cmd){
+      case "list_devices": return Promise.resolve(JSON.parse(JSON.stringify(mockDevices)));
+      case "bridge_status": return Promise.resolve(JSON.parse(JSON.stringify(mockBridge)));
+      case "bridge_start": mockBridge.running=true; mockBridge.last_poll=new Date().toISOString(); return Promise.resolve("Bridge started · polling every 30s");
+      case "bridge_stop": mockBridge.running=false; return Promise.resolve("Bridge stopped");
+      case "bridge_tick_once":
+        mockBridge.last_poll=new Date().toISOString(); mockBridge.jobs_done+=1;
+        return Promise.resolve("1 job claimed → posted on "+mockDevices[0].model);
       case "get_review_queue": return Promise.resolve(JSON.parse(JSON.stringify(mockClips)));
       case "get_analytics": return Promise.resolve({total_clips:37, approved:mockClips.approved.length, posted:12, pending:mockClips.pending.length, today_count:5});
       case "get_settings": return Promise.resolve(mockSettings);
@@ -306,6 +375,7 @@
   // ---- routing ----
   var titles={review:["Review queue","Approve or reject produced clips. Nothing posts without your yes."],
     produce:["Produce","Queue sources for local rendering into vertical clips."],
+    bridge:["Bridge","Post approved clips from the VPS on the phones wired to this machine."],
     analytics:["Analytics","Local counts from this operator's clip database."],
     settings:["Settings","Connect to your fleet and tune this station."]};
   document.querySelectorAll(".navbtn").forEach(function(b){ b.addEventListener("click",function(){
@@ -315,6 +385,7 @@
     $("sec-"+s).classList.add("on");
     $("secTitle").textContent=titles[s][0]; $("secSub").textContent=titles[s][1];
     if(s==="analytics") loadAnalytics(); if(s==="review") loadReview();
+    if(s==="bridge"){ loadBridge(); loadBridgeDevices(); }
   }); });
 
   // ---- review ----
@@ -439,9 +510,102 @@
 
   function loadBadges(){ call("get_review_queue").then(function(q){ $("bReview").textContent=(q.pending||[]).length; }).catch(function(){}); }
 
+  // ---- bridge ----
+  var LOG_CAP=200, brTicking=false;
+
+  function fmtTs(ts){
+    if(!ts) return "";
+    var d=new Date(ts);
+    if(isNaN(d.getTime())) return String(ts);
+    return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0")+":"+String(d.getSeconds()).padStart(2,"0");
+  }
+
+  function renderBridgeStatus(st){
+    st=st||{};
+    var running=!!st.running;
+    $("brDot").className="dot "+(running?"up":"down");
+    $("brState").textContent=running?"Bridge running":"Bridge stopped";
+    $("brStatePill").classList.toggle("live", running);
+    var alive=!!st.mobileuse_alive;
+    $("brMuDot").className="dot "+(alive?"up":"down");
+    $("brMuState").textContent="Mobile-Use · "+(alive?"reachable":"offline");
+    $("brMuPill").classList.toggle("live", alive);
+    $("brPollPill").textContent="last poll · "+(st.last_poll?fmtTs(st.last_poll):"never");
+    $("brDone").textContent=(st.jobs_done==null)?"—":st.jobs_done;
+    $("brFailed").textContent=(st.jobs_failed==null)?"—":st.jobs_failed;
+    $("brStart").disabled=running;
+    $("brStop").disabled=!running;
+    $("brTick").disabled=brTicking;
+  }
+
+  function loadBridge(){ return call("bridge_status").then(renderBridgeStatus)
+    .catch(function(e){ toast("Bridge status failed: "+e,1); }); }
+
+  function loadBridgeDevices(){ return call("list_devices").then(function(list){
+    list=list||[]; var el=$("brDevList");
+    $("bBridge").textContent=list.length;
+    if(!list.length){ el.innerHTML='<div class="empty" style="padding:1.6rem 0">No devices. Connect a phone via USB and start Mobile-Use.</div>'; return; }
+    el.innerHTML=list.map(function(d){
+      return '<div class="devrow"><span class="did">'+esc(d.id)+'</span>'+
+        '<span class="dmodel">'+esc(d.model||"unknown model")+'</span>'+
+        '<span class="qs">'+esc(d.status||"—")+'</span></div>';
+    }).join("");
+  }).catch(function(e){ toast("Device list failed: "+e,1); }); }
+
+  function appendBridgeLog(level,message,ts){
+    var el=$("brLog"); if(!el) return;
+    var none=el.querySelector(".none"); if(none) none.remove();
+    var atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+    var ln=document.createElement("div");
+    ln.className="ln"+(level==="error"?" err":"");
+    ln.innerHTML='<span class="t">'+esc(fmtTs(ts)||fmtTs(new Date().toISOString()))+'</span><span>'+esc(message==null?"":String(message))+'</span>';
+    el.appendChild(ln);
+    while(el.childElementCount>LOG_CAP) el.removeChild(el.firstElementChild);
+    if(atBottom) el.scrollTop=el.scrollHeight;
+  }
+
+  $("brStart").addEventListener("click",function(){
+    $("brStart").disabled=true;
+    call("bridge_start").then(function(msg){ toast(esc(String(msg||"Bridge started"))); appendBridgeLog("info",String(msg||"Bridge started")); loadBridge(); })
+      .catch(function(e){ $("brStart").disabled=false; appendBridgeLog("error","start failed: "+e); toast("Start failed: "+e,1); });
+  });
+  $("brStop").addEventListener("click",function(){
+    $("brStop").disabled=true;
+    call("bridge_stop").then(function(msg){ toast(esc(String(msg||"Bridge stopped"))); appendBridgeLog("info",String(msg||"Bridge stopped")); loadBridge(); })
+      .catch(function(e){ $("brStop").disabled=false; appendBridgeLog("error","stop failed: "+e); toast("Stop failed: "+e,1); });
+  });
+  $("brTick").addEventListener("click",function(){
+    brTicking=true; $("brTick").disabled=true;
+    call("bridge_tick_once").then(function(msg){ brTicking=false; toast(esc(String(msg||"Nothing to do"))); appendBridgeLog("info",String(msg||"Nothing to do")); loadBridge(); })
+      .catch(function(e){ brTicking=false; $("brTick").disabled=false; appendBridgeLog("error","run failed: "+e); toast("Run failed: "+e,1); });
+  });
+  $("brDevRefresh").addEventListener("click",loadBridgeDevices);
+
+  function subscribeBridge(){
+    if(!_listen) return;
+    try{
+      _listen("bridge-log",function(ev){ var p=(ev&&ev.payload)||{}; appendBridgeLog(p.level,p.message,p.ts); });
+      _listen("bridge-status",function(ev){ if(ev&&ev.payload) renderBridgeStatus(ev.payload); });
+    }catch(e){ /* events unavailable — panel still works via polling buttons */ }
+  }
+
+  function seedBridgeDemo(){
+    var now=Date.now();
+    [["info","adb: 2 devices attached"],
+     ["info","mobile-use server up on 127.0.0.1:8765"],
+     ["info","claimed job job_7f21 → tiktok on Pixel 6a"],
+     ["error","Galaxy A54: upload timed out, job requeued"],
+     ["info","posted job_7f21 · reported back to VPS"]].forEach(function(l,i){
+      appendBridgeLog(l[0], l[1], new Date(now-(5-i)*42000).toISOString());
+    });
+  }
+
   // ---- boot ----
   if(!LIVE) $("demoBadge").style.display="";
-  loadSettings(); loadReview(); renderProduce();
+  $("brLog").innerHTML='<div class="none">Waiting for bridge activity…</div>';
+  subscribeBridge();
+  if(!LIVE) seedBridgeDemo();
+  loadSettings(); loadReview(); renderProduce(); loadBridge(); loadBridgeDevices();
 })();
 </script>
 

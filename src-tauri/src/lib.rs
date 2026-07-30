@@ -4,6 +4,7 @@
 mod api;
 mod commands;
 mod db;
+mod mobileuse_bridge;
 #[allow(dead_code)] // The rendering checkpoint will connect this tested queue to commands.
 mod queue;
 mod sidecar;
@@ -28,6 +29,10 @@ pub fn run() {
             let db_path = app_dir.join("clip4clicks.db");
             let database = db::Database::init(&db_path)?;
             app.manage(database);
+
+            // Desktop bridge: claims approved post jobs from the VPS and runs
+            // them on phones attached to this machine via Mobile-Use.
+            app.manage(mobileuse_bridge::BridgeState::new());
 
             // Check for ffmpeg/yt-dlp sidecars
             let sidecar_dir = app
@@ -57,6 +62,11 @@ pub fn run() {
             commands::sync_with_vps,
             commands::get_settings,
             commands::save_settings,
+            mobileuse_bridge::list_devices,
+            mobileuse_bridge::bridge_start,
+            mobileuse_bridge::bridge_stop,
+            mobileuse_bridge::bridge_status,
+            mobileuse_bridge::bridge_tick_once,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Clip4Clicks");
