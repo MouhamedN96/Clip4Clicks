@@ -11,8 +11,9 @@ const ProductionPipeline = require('../production/pipeline');
 const HiggsfieldProducer = require('../production/higgsfield');
 const StockReelProducer = require('../production/stockreel');
 const ProductAdProducer = require('../production/productad');
-const PostingProducer = require('../production/posting');
-const EngagementProducer = require('../production/engagement');
+// posting/engagement export plain function collections (not classes).
+const posting = require('../production/posting');
+const engagement = require('../production/engagement');
 
 const config = {
     whop: {
@@ -29,9 +30,6 @@ const pipeline = new ProductionPipeline({ dataDir: process.env.CLIP_DATA_DIR || 
 const higgsfield = new HiggsfieldProducer({ dataDir: process.env.CLIP_DATA_DIR || '/app/data' });
 const stockReel = new StockReelProducer({ dataDir: process.env.CLIP_DATA_DIR || '/app/data' });
 const productAd = new ProductAdProducer({ dataDir: process.env.CLIP_DATA_DIR || '/app/data' });
-
-const posting = new PostingProducer();
-const engagement = new EngagementProducer();
 
 // Mobile-Use is optional at boot: check lazily only when a post/engagement job runs.
 let mobileuseReady = false;
