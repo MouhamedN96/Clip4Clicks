@@ -592,18 +592,33 @@ async function runWorker(queueName, processor) {
 async function main() {
     console.log('ClipForge Worker starting...');
 
-    // Start workers for each queue
-    await Promise.all([
+    // Device-touching queues (post/outreach/engagement) run wherever Mobile-Use
+    // is: on the operator's DESKTOP, never the VPS (no phones). With
+    // POST_EXECUTOR=desktop the worker SKIPS those consumers and the Tauri
+    // desktop bridge claims them via /api/bridge/* instead. Default 'worker'
+    // preserves the old behavior for a machine that has phones + the worker.
+    const deviceOnDesktop = process.env.POST_EXECUTOR === 'desktop';
+    if (deviceOnDesktop) {
+        console.log('POST_EXECUTOR=desktop → worker defers post/outreach/engagement to the desktop bridge');
+    }
+
+    const workers = [
         runWorker(queues.clip, processClipJob),
         runWorker(queues.generate, processGenerateJob),
         runWorker(queues.reel, processReelJob),
         runWorker(queues.productAd, processProductAdJob),
-        runWorker(queues.post, processPostJob),
-        runWorker(queues.outreach, processOutreachJob),
-        runWorker(queues.engagement, processEngagementJob),
         runWorker(queues.onboarding, processOnboardingJob),
         runWorker(queues.analytics, processAnalyticsJob)
-    ]);
+    ];
+    if (!deviceOnDesktop) {
+        workers.push(
+            runWorker(queues.post, processPostJob),
+            runWorker(queues.outreach, processOutreachJob),
+            runWorker(queues.engagement, processEngagementJob)
+        );
+    }
+
+    await Promise.all(workers);
 }
 
 main().catch(error => {

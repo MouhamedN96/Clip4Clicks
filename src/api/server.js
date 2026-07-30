@@ -7,6 +7,8 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
+const fs = require('fs');
+const path = require('path');
 const { Pool } = require('pg');
 const Redis = require('ioredis');
 const WhopIntegration = require('../integration/whop');
@@ -848,6 +850,97 @@ app.post('/api/engagement/:id/reject', async (req, res) => {
     } catch (error) {
         console.error('Engagement reject error:', error);
         res.status(500).json({ error: 'Failed to reject engagement action' });
+    }
+});
+
+// ============================================
+// DESKTOP BRIDGE (Mobile-Use runs on the operator's laptop, not the VPS)
+// ============================================
+// The VPS produces + gates; it cannot touch phones. The Tauri desktop app runs
+// Mobile-Use locally and CLAIMS device jobs here, executes them on real phones,
+// downloads the clip file, and REPORTS results back. Enabled by POST_EXECUTOR=desktop
+// (the VPS worker then skips the post_queue consumer — see worker/index.js).
+
+// Claim the next approved post job (atomic RPOP off post_queue). Marks the clip
+// 'posting' and returns the job plus a file URL the desktop downloads from.
+app.get('/api/bridge/posts/claim', async (req, res) => {
+    try {
+        const raw = await redis.rpop('post_queue');
+        if (!raw) return res.json({ job: null });
+        const job = JSON.parse(raw);
+        if (job.clipId) {
+            const c = await pool.connect();
+            try {
+                await c.query(
+                    `UPDATE clips SET status = 'posting',
+                     metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb
+                     WHERE id = $2 AND status = 'approved'`,
+                    [JSON.stringify({ claimedBy: req.query.device || 'desktop', claimedAt: new Date().toISOString() }), job.clipId]
+                );
+            } finally { c.release(); }
+        }
+        job.fileUrl = job.clipId ? `/api/bridge/clips/${job.clipId}/file` : null;
+        res.json({ job });
+    } catch (error) {
+        console.error('Bridge claim error:', error);
+        res.status(500).json({ error: 'Failed to claim post job' });
+    }
+});
+
+// Stream the produced mp4 for a clip so the desktop can hand it to Mobile-Use.
+// Path comes from clips.metadata.clipPath and is confined to CLIP_DATA_DIR.
+app.get('/api/bridge/clips/:id/file', async (req, res) => {
+    try {
+        const c = await pool.connect();
+        let clipPath;
+        try {
+            const r = await c.query('SELECT metadata FROM clips WHERE id = $1', [req.params.id]);
+            if (!r.rows.length) return res.status(404).json({ error: 'Clip not found' });
+            clipPath = (r.rows[0].metadata || {}).clipPath;
+        } finally { c.release(); }
+        if (!clipPath) return res.status(404).json({ error: 'Clip has no rendered file' });
+
+        const dataDir = path.resolve(process.env.CLIP_DATA_DIR || '/app/data');
+        const resolved = path.resolve(clipPath);
+        if (!resolved.startsWith(dataDir) || !fs.existsSync(resolved)) {
+            return res.status(404).json({ error: 'File not available' });
+        }
+        res.download(resolved);
+    } catch (error) {
+        console.error('Bridge file error:', error);
+        res.status(500).json({ error: 'Failed to serve clip file' });
+    }
+});
+
+// Desktop reports the outcome of a post job (mirrors the worker's status update).
+app.post('/api/bridge/posts/:clipId/result', async (req, res) => {
+    try {
+        const { results } = req.body || {};
+        if (!Array.isArray(results)) {
+            return res.status(400).json({ error: 'results array required' });
+        }
+        const anyPosted = results.some(r => r && r.success);
+        const c = await pool.connect();
+        try {
+            await c.query(
+                `UPDATE clips SET status = $1,
+                 metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb
+                 WHERE id = $3`,
+                [anyPosted ? 'posted' : 'failed',
+                 JSON.stringify({ postResults: results, postedAt: anyPosted ? new Date().toISOString() : undefined, dryRun: false }),
+                 req.params.clipId]
+            );
+            if (anyPosted) {
+                await c.query(
+                    `UPDATE clips SET platforms_posted = $1, posted_at = NOW() WHERE id = $2`,
+                    [results.filter(r => r.success).map(r => r.platform), req.params.clipId]
+                );
+            }
+        } finally { c.release(); }
+        res.json({ status: anyPosted ? 'posted' : 'failed', clipId: req.params.clipId });
+    } catch (error) {
+        console.error('Bridge result error:', error);
+        res.status(500).json({ error: 'Failed to record post result' });
     }
 });
 
