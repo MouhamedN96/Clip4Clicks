@@ -24,3 +24,5 @@ tmp/
 .DS_Store
 __MACOSX/
 Thumbs.db
+src-tauri/target/
+target/
