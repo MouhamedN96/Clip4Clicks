@@ -900,12 +900,16 @@ app.get('/api/bridge/clips/:id/file', async (req, res) => {
         } finally { c.release(); }
         if (!clipPath) return res.status(404).json({ error: 'Clip has no rendered file' });
 
-        const dataDir = path.resolve(process.env.CLIP_DATA_DIR || '/app/data');
-        const resolved = path.resolve(clipPath);
-        if (!resolved.startsWith(dataDir) || !fs.existsSync(resolved)) {
+        // Confine to CLIP_DATA_DIR: append a separator so "/app/data" can't match
+        // "/app/data-evil", and resolve symlinks (realpath) before comparing.
+        const dataDir = path.resolve(process.env.CLIP_DATA_DIR || '/app/data') + path.sep;
+        let real;
+        try { real = fs.realpathSync(path.resolve(clipPath)); }
+        catch { return res.status(404).json({ error: 'File not available' }); }
+        if (!(real + path.sep).startsWith(dataDir)) {
             return res.status(404).json({ error: 'File not available' });
         }
-        res.download(resolved);
+        res.download(real);
     } catch (error) {
         console.error('Bridge file error:', error);
         res.status(500).json({ error: 'Failed to serve clip file' });
