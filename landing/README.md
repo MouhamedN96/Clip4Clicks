@@ -20,7 +20,33 @@ Open `index.html` and edit directly — it's one file. Common changes:
 - Gallery demos: the `clips` array in the `<script>` (caption, platform, views).
 - Ticker copy: the `.ticker .track` spans (keep the two spans identical).
 
-## Deploy — GitHub Pages (live)
+## Deploy — Cloudflare Pages (preferred)
+
+Better than GitHub Pages for this project for three concrete reasons: far stronger
+edge presence in the Gulf/MENA/Africa markets we route products to; Pages Functions
+(so the "send me 3 clips" CTA can actually capture leads into KV/D1 without a
+third-party form service); and native apex-domain + cache/WAF control.
+
+**Git integration (no token needed):** Cloudflare dashboard → Workers & Pages →
+Create → Pages → Connect to Git → repo `MouhamedN96/Clip4Clips`, branch `main`,
+**build command: none**, **build output directory: `landing`**. Every push that
+touches `landing/` redeploys. Then retire `.github/workflows/deploy-landing.yml`.
+
+**Or from the CLI:**
+```bash
+npx wrangler pages deploy landing --project-name clip4clicks
+```
+Needs `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID`. If the token has an IP
+allowlist you'll get `code: 9109` — add the machine's IP or drop the restriction.
+
+`landing/_headers` ships security headers + no-cache on the HTML (honored by
+Cloudflare Pages and Netlify; ignored by GitHub Pages). The CSP is strict because
+the page makes zero external requests.
+
+**Custom domain:** add it on the Pages project; if the domain's nameservers are on
+Cloudflare, apex works natively — no A records to hardcode.
+
+## Deploy — GitHub Pages (currently live)
 
 This is the deploy in use. `.github/workflows/deploy-landing.yml` publishes this
 folder to GitHub Pages on every push to `main` that touches `landing/`. Edit

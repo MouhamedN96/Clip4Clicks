@@ -1,0 +1,18 @@
+# Cloudflare Pages headers (also honored by Netlify).
+# The landing page is a single self-contained file: inline CSS/JS, a hand-written
+# WebGL shader, and a data-URI favicon — no external requests at all. So the CSP
+# can be strict and still not break anything.
+
+/*
+  X-Frame-Options: DENY
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: geolocation=(), microphone=(), camera=(), interest-cohort=()
+  Content-Security-Policy: default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; font-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'
+
+# HTML: always revalidate so a redeploy is visible immediately.
+/index.html
+  Cache-Control: public, max-age=0, must-revalidate
+
+/
+  Cache-Control: public, max-age=0, must-revalidate
