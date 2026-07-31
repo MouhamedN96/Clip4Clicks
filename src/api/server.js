@@ -778,32 +778,20 @@ app.post('/api/engagement/:id/approve', async (req, res) => {
                 [JSON.stringify({ engagement: eng }), clipId]
             );
 
-            // Queue for execution via outreach_queue (DM) or direct Mobile-Use (reply)
-            if (item.type === 'dm') {
-                await redis.lpush('outreach_queue', JSON.stringify({
-                    messageId: null,
-                    targetHandle: item.comment.username,
-                    targetPlatform: item.platform || 'tiktok',
-                    message: item.dmText,
-                    clientId: null,
-                    queuedAt: new Date().toISOString()
-                }));
-            } else {
-                // Reply: execute directly via Mobile-Use (or dry-run)
-                const alive = await mobileuse.isAlive();
-                if (alive) {
-                    const deviceId = await mobileuse.pickDevice(item.platform || 'tiktok');
-                    if (deviceId) {
-                        await engagementProducer.executeReply({
-                            deviceId,
-                            platform: item.platform || 'tiktok',
-                            comment: item.comment,
-                            replyText: item.replyText,
-                            mobileuse
-                        });
-                    }
-                }
-            }
+            // Both replies and DMs are DEVICE actions, so both go on the queue for
+            // whoever owns the phones (the desktop bridge under POST_EXECUTOR=desktop).
+            // Never call Mobile-Use from here — the VPS has no handsets attached.
+            await redis.lpush('outreach_queue', JSON.stringify({
+                type: item.type === 'dm' ? 'dm' : 'reply',
+                messageId: null,
+                clipId,
+                engagementId: req.params.id,
+                targetHandle: item.comment && item.comment.username,
+                targetPlatform: item.platform || 'tiktok',
+                message: item.type === 'dm' ? item.dmText : item.replyText,
+                comment: item.comment || null,
+                queuedAt: new Date().toISOString()
+            }));
 
             res.json({ status: 'approved', id: req.params.id, clipId });
         } finally {
@@ -966,6 +954,124 @@ app.post('/api/bridge/posts/:clipId/result', async (req, res) => {
     } catch (error) {
         console.error('Bridge result error:', error);
         res.status(500).json({ error: 'Failed to record post result' });
+    }
+});
+
+// ---- engagement scans (desktop reads the comments, VPS does the thinking) ----
+
+// Claim the next comment-scan job.
+app.get('/api/bridge/engagement/claim', async (req, res) => {
+    try {
+        const raw = await redis.rpop('engagement_queue');
+        if (!raw) return res.json({ job: null });
+        res.json({ job: JSON.parse(raw) });
+    } catch (error) {
+        console.error('Bridge engagement claim error:', error);
+        res.status(500).json({ error: 'Failed to claim engagement job' });
+    }
+});
+
+// Desktop reports the comments it read off the screen. Keyword matching and
+// reply/DM drafting happen HERE (not on the desktop) so the device side stays a
+// dumb executor and the logic lives in one place. Proposals land in
+// clips.metadata.engagement.pending → the human gate at /api/engagement/queue.
+app.post('/api/bridge/engagement/:clipId/result', async (req, res) => {
+    try {
+        const { comments, link, platform } = req.body || {};
+        if (!Array.isArray(comments)) {
+            return res.status(400).json({ error: 'comments array required' });
+        }
+
+        const matched = engagementProducer.matchKeywords(comments);
+        const c = await pool.connect();
+        try {
+            const r = await c.query('SELECT metadata FROM clips WHERE id = $1', [req.params.clipId]);
+            if (!r.rows.length) return res.status(404).json({ error: 'Clip not found' });
+
+            const meta = r.rows[0].metadata || {};
+            const storeLink = link || meta.storeUrl || null;
+            const plat = platform || (meta.platforms_posted || meta.platforms || ['tiktok'])[0];
+            const eng = meta.engagement || { pending: [] };
+            const now = new Date().toISOString();
+
+            for (const comment of matched) {
+                // Propose BOTH a public reply and a DM per buying-intent comment;
+                // the human approves each independently.
+                const reply = engagementProducer.proposeReply(comment, { link: storeLink });
+                const dm = engagementProducer.proposeDM(comment, { link: storeLink });
+                eng.pending = [
+                    ...(eng.pending || []),
+                    { id: `${Date.now()}-r-${comment.username}`, clipId: req.params.clipId, platform: plat,
+                      comment, replyText: reply.replyText, type: 'reply', status: 'pending_review', createdAt: now },
+                    { id: `${Date.now()}-d-${comment.username}`, clipId: req.params.clipId, platform: plat,
+                      comment, dmText: dm.dmText, link: dm.link, type: 'dm', status: 'pending_review', createdAt: now }
+                ];
+            }
+            eng.lastScanAt = now;
+
+            await c.query(
+                `UPDATE clips SET metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb WHERE id = $2`,
+                [JSON.stringify({ engagement: eng }), req.params.clipId]
+            );
+        } finally { c.release(); }
+
+        res.json({ status: 'scanned', scanned: comments.length, matched: matched.length,
+                   proposed: matched.length * 2 });
+    } catch (error) {
+        console.error('Bridge engagement result error:', error);
+        res.status(500).json({ error: 'Failed to record engagement scan' });
+    }
+});
+
+// ---- approved device actions: replies + DMs (human already said yes) ----
+
+app.get('/api/bridge/actions/claim', async (req, res) => {
+    try {
+        const raw = await redis.rpop('outreach_queue');
+        if (!raw) return res.json({ job: null });
+        res.json({ job: JSON.parse(raw) });
+    } catch (error) {
+        console.error('Bridge action claim error:', error);
+        res.status(500).json({ error: 'Failed to claim action' });
+    }
+});
+
+// Desktop reports whether the reply/DM actually sent.
+app.post('/api/bridge/actions/result', async (req, res) => {
+    try {
+        const { messageId, clipId, engagementId, success, error: errMsg } = req.body || {};
+        const c = await pool.connect();
+        try {
+            // Cold-outreach rows live in outreach_messages.
+            if (messageId) {
+                await c.query(
+                    `UPDATE outreach_messages SET status = $1, message_sent_at = $2 WHERE id = $3`,
+                    [success ? 'sent' : 'failed', success ? new Date().toISOString() : null, messageId]
+                );
+            }
+            // Engagement actions live inside clips.metadata.engagement.pending.
+            if (clipId && engagementId) {
+                const r = await c.query('SELECT metadata FROM clips WHERE id = $1', [clipId]);
+                if (r.rows.length) {
+                    const meta = r.rows[0].metadata || {};
+                    const eng = meta.engagement || { pending: [] };
+                    const item = (eng.pending || []).find(p => (p.id || p.createdAt) === engagementId);
+                    if (item) {
+                        item.status = success ? 'sent' : 'failed';
+                        item.sentAt = success ? new Date().toISOString() : null;
+                        if (errMsg) item.error = errMsg;
+                        await c.query(
+                            `UPDATE clips SET metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb WHERE id = $2`,
+                            [JSON.stringify({ engagement: eng }), clipId]
+                        );
+                    }
+                }
+            }
+        } finally { c.release(); }
+        res.json({ status: success ? 'sent' : 'failed' });
+    } catch (error) {
+        console.error('Bridge action result error:', error);
+        res.status(500).json({ error: 'Failed to record action result' });
     }
 });
 
