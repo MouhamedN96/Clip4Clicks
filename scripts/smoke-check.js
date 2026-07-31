@@ -84,7 +84,7 @@ async function api(method, endpoint, body, raw) {
 async function waitClip(id, wanted, timeoutMs = 30000) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-        const { rows } = await pool.query('SELECT status, metadata FROM clips WHERE id = $1', [id]);
+        const { rows } = await pool.query('SELECT status, metadata, platforms_posted FROM clips WHERE id = $1', [id]);
         if (rows[0] && wanted.includes(rows[0].status)) return rows[0];
         await sleep(500);
     }
@@ -181,11 +181,20 @@ async function main() {
 
         if (DESKTOP_EXEC) {
             try {
-                const claim = await api('GET', '/api/bridge/posts/claim?device=smoke');
-                const job = claim.json?.job;
-                job && job.clipId === clipId && job.fileUrl
+                // The queue is FIFO, so a busy/previously-failed run can leave
+                // older jobs ahead of ours. Claim a few times to find our own,
+                // and name anything else we consume rather than eating it silently.
+                let job = null;
+                for (let i = 0; i < 5; i++) {
+                    const claim = await api('GET', '/api/bridge/posts/claim?device=smoke');
+                    const j = claim.json?.job;
+                    if (!j) break;
+                    if (j.clipId === clipId) { job = j; break; }
+                    console.log(`    · skipped a pre-existing post job (clip ${j.clipId})`);
+                }
+                job && job.fileUrl
                     ? ok('bridge: desktop claimed the post job (has fileUrl)')
-                    : bad(`bridge claim: ${JSON.stringify(claim.json)}`);
+                    : bad('bridge claim: never returned this smoke\'s job');
 
                 const file = await api('GET', `/api/bridge/clips/${clipId}/file`, null, true);
                 file.status === 200 ? ok('bridge: clip file downloadable') : bad(`file download: HTTP ${file.status}`);
@@ -220,11 +229,17 @@ async function main() {
             try {
                 if (DESKTOP_EXEC) {
                     // Same as above: the desktop owns outreach_queue, so play it.
-                    const claim = await api('GET', '/api/bridge/actions/claim');
-                    const job = claim.json?.job;
-                    job && job.messageId === mid
+                    let job = null;
+                    for (let i = 0; i < 5; i++) {
+                        const claim = await api('GET', '/api/bridge/actions/claim');
+                        const j = claim.json?.job;
+                        if (!j) break;
+                        if (j.messageId === mid) { job = j; break; }
+                        console.log(`    · skipped a pre-existing action (${j.type || 'dm'} → ${j.targetHandle})`);
+                    }
+                    job
                         ? ok('bridge: desktop claimed the DM action')
-                        : bad(`bridge action claim: ${JSON.stringify(claim.json)}`);
+                        : bad('bridge action claim: never returned this smoke\'s DM');
                     await api('POST', '/api/bridge/actions/result', { messageId: mid, success: true });
                     await waitOutreach(mid, ['sent']);
                     ok('bridge: DM result reported → sent');
