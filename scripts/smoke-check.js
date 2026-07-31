@@ -20,6 +20,11 @@ const { Pool } = require('pg');
 
 const API = process.env.API_URL || 'http://localhost:3000';
 const DATA_DIR = process.env.CLIP_DATA_DIR || '/app/data';
+// With POST_EXECUTOR=desktop the worker leaves post/outreach queues to the Tauri
+// bridge, so the smoke plays the desktop (claim → report) instead of waiting for
+// a worker that will never pick them up.
+const DESKTOP_EXEC = process.env.POST_EXECUTOR === 'desktop';
+const BRIDGE_TOKEN = process.env.BRIDGE_TOKEN || process.env.API_SECRET || '';
 const pool = new Pool({
     host: process.env.POSTGRES_HOST, port: process.env.POSTGRES_PORT,
     database: process.env.POSTGRES_DB, user: process.env.POSTGRES_USER,
@@ -57,12 +62,19 @@ function run(cmd, args) {
     });
 }
 
-async function api(method, endpoint, body) {
+// /api/bridge/* is Bearer-authed (the desktop bridge's shared secret), so send
+// the token on those routes. `raw` skips body parsing for binary downloads.
+async function api(method, endpoint, body, raw) {
+    const headers = { 'Content-Type': 'application/json' };
+    if (endpoint.startsWith('/api/bridge/') && BRIDGE_TOKEN) {
+        headers.Authorization = `Bearer ${BRIDGE_TOKEN}`;
+    }
     const res = await fetch(`${API}${endpoint}`, {
         method,
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: body ? JSON.stringify(body) : undefined
     });
+    if (raw) return { status: res.status, bytes: (await res.arrayBuffer()).byteLength };
     const text = await res.text();
     let json; try { json = JSON.parse(text); } catch { json = { raw: text }; }
     return { status: res.status, json };
@@ -158,14 +170,41 @@ async function main() {
         } catch (e) { bad(e.message); }
     }
 
-    // 5. Clip HITL gate: approve → dry-run post → posted
+    // 5. Clip HITL gate: approve → post.
+    // Who posts depends on POST_EXECUTOR. With 'desktop' (the norm — the VPS has
+    // no phones) the worker deliberately ignores post_queue and the Tauri bridge
+    // claims it, so we PLAY THE DESKTOP here: claim → report → expect posted.
+    // That exercises the real path end-to-end without needing a handset.
     if (clipId) {
         const r = await api('POST', `/api/clips/${clipId}/approve`, { platforms: ['tiktok'] });
         r.status === 200 ? ok('clip approved (queued for posting)') : bad(`approve: ${JSON.stringify(r.json)}`);
-        try {
-            const row = await waitClip(clipId, ['posted']);
-            row.metadata?.dryRun === true ? ok('dry-run poster fired → posted (dryRun)') : bad(`posted but dryRun=${row.metadata?.dryRun}`);
-        } catch (e) { bad(e.message); }
+
+        if (DESKTOP_EXEC) {
+            try {
+                const claim = await api('GET', '/api/bridge/posts/claim?device=smoke');
+                const job = claim.json?.job;
+                job && job.clipId === clipId && job.fileUrl
+                    ? ok('bridge: desktop claimed the post job (has fileUrl)')
+                    : bad(`bridge claim: ${JSON.stringify(claim.json)}`);
+
+                const file = await api('GET', `/api/bridge/clips/${clipId}/file`, null, true);
+                file.status === 200 ? ok('bridge: clip file downloadable') : bad(`file download: HTTP ${file.status}`);
+
+                const rep = await api('POST', `/api/bridge/posts/${clipId}/result`,
+                    { results: [{ platform: 'tiktok', success: true }] });
+                rep.json?.status === 'posted' ? ok('bridge: result reported → posted') : bad(`report: ${JSON.stringify(rep.json)}`);
+
+                const row = await waitClip(clipId, ['posted']);
+                (row.platforms_posted || []).includes('tiktok')
+                    ? ok('clip posted, platforms_posted recorded')
+                    : bad(`posted but platforms_posted=${JSON.stringify(row.platforms_posted)}`);
+            } catch (e) { bad(e.message); }
+        } else {
+            try {
+                const row = await waitClip(clipId, ['posted']);
+                row.metadata?.dryRun === true ? ok('dry-run poster fired → posted (dryRun)') : bad(`posted but dryRun=${row.metadata?.dryRun}`);
+            } catch (e) { bad(e.message); }
+        }
     }
 
     // 6. Outreach HITL gate: stage → approve → dry-run send → sent
@@ -179,8 +218,20 @@ async function main() {
             const appr = await api('POST', `/api/outreach/${mid}/approve`, {});
             appr.status === 200 ? ok('outreach approved') : bad(`outreach approve: ${JSON.stringify(appr.json)}`);
             try {
-                await waitOutreach(mid, ['sent']);
-                ok('dry-run DM fired → sent');
+                if (DESKTOP_EXEC) {
+                    // Same as above: the desktop owns outreach_queue, so play it.
+                    const claim = await api('GET', '/api/bridge/actions/claim');
+                    const job = claim.json?.job;
+                    job && job.messageId === mid
+                        ? ok('bridge: desktop claimed the DM action')
+                        : bad(`bridge action claim: ${JSON.stringify(claim.json)}`);
+                    await api('POST', '/api/bridge/actions/result', { messageId: mid, success: true });
+                    await waitOutreach(mid, ['sent']);
+                    ok('bridge: DM result reported → sent');
+                } else {
+                    await waitOutreach(mid, ['sent']);
+                    ok('dry-run DM fired → sent');
+                }
             } catch (e) { bad(e.message); }
         }
     }
