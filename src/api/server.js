@@ -607,6 +607,7 @@ app.post('/api/posts/:clipId/scan', async (req, res) => {
         // Look up clip metadata for link if not provided
         let storeLink = link;
         let plat = platform || 'tiktok';
+        let url = clipUrl || null;
         const dbClient = await pool.connect();
         try {
             const result = await dbClient.query('SELECT metadata FROM clips WHERE id = $1', [req.params.clipId]);
@@ -614,6 +615,15 @@ app.post('/api/posts/:clipId/scan', async (req, res) => {
                 const meta = result.rows[0].metadata || {};
                 if (!storeLink) storeLink = meta.storeUrl || null;
                 if (!platform) plat = (meta.platforms_posted || meta.platforms || ['tiktok'])[0];
+                if (!url) url = meta.clipUrl || null;
+            }
+            // Persist the post URL so approved replies can target THIS video
+            // instead of "the most recent post" (which may be a newer clip).
+            if (url) {
+                await dbClient.query(
+                    `UPDATE clips SET metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb WHERE id = $2`,
+                    [JSON.stringify({ clipUrl: url }), req.params.clipId]
+                );
             }
         } finally {
             dbClient.release();
@@ -623,7 +633,7 @@ app.post('/api/posts/:clipId/scan', async (req, res) => {
             clipId: req.params.clipId,
             platform: plat,
             deviceId: deviceId || null,
-            clipUrl: clipUrl || null,
+            clipUrl: url,
             link: storeLink,
             queuedAt: new Date().toISOString()
         }));
@@ -790,6 +800,9 @@ app.post('/api/engagement/:id/approve', async (req, res) => {
                 targetPlatform: item.platform || 'tiktok',
                 message: item.type === 'dm' ? item.dmText : item.replyText,
                 comment: item.comment || null,
+                // Lets the device open THIS post to reply, rather than guessing
+                // at "the most recent one" (which may be a newer clip).
+                clipUrl: meta.clipUrl || null,
                 queuedAt: new Date().toISOString()
             }));
 
