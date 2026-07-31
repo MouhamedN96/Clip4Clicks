@@ -1,16 +1,27 @@
 // Mobile-Use bridge — the desktop half of the "VPS makes videos, this machine
 // owns the phones" split.
 //
-// The VPS renders clips and gates them behind human approval but has no phones
-// attached. This module polls the VPS for approved post jobs, downloads the
-// rendered mp4 locally, and drives a real Android handset through the local
-// Mobile-Use HTTP agent (github.com/minitap-ai/mobile-use), then reports the
-// per-platform outcome back to the VPS.
+// The VPS renders clips, gates them behind human approval, and decides what to
+// say; it has no phones attached. This module drains the three queues the VPS
+// defers to the desktop, driving real Android handsets through the local
+// Mobile-Use HTTP agent (github.com/minitap-ai/mobile-use):
+//
+//   1. posts       — download the rendered mp4 and publish it
+//   2. engagement  — open a posted clip and read its comment section
+//   3. actions     — send human-approved replies and DMs
+//
+// The device side is a dumb executor. Keyword matching, buying-intent scoring
+// and reply drafting all happen on the VPS; this module only ships raw comments
+// up and types approved text back.
 //
 // VPS contract (all requests carry `Authorization: Bearer <api_key>`):
-//   GET  /api/bridge/posts/claim?device=<name>  -> { job: null } | { job: {...} }
-//   GET  /api/bridge/clips/<clipId>/file        -> mp4 bytes
-//   POST /api/bridge/posts/<clipId>/result      <- { results: [{platform,success,error?}] }
+//   GET  /api/bridge/posts/claim?device=<name> -> { job: null } | { job: {...} }
+//   GET  /api/bridge/clips/<clipId>/file       -> mp4 bytes
+//   POST /api/bridge/posts/<clipId>/result     <- { results: [{platform,success,error?}] }
+//   GET  /api/bridge/engagement/claim          -> { job: null } | { job: {...} }
+//   POST /api/bridge/engagement/<clipId>/result<- { comments: [{username,text}], platform, link }
+//   GET  /api/bridge/actions/claim             -> { job: null } | { job: {...} }
+//   POST /api/bridge/actions/result            <- { messageId, clipId, engagementId, success, error? }
 //
 // Mobile-Use contract (best-effort shapes, parsed defensively):
 //   GET  /devices                     -> { devices: [{id,model,status}] }
@@ -30,6 +41,16 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_store::StoreExt;
 
+/// Seconds in the rolling window used for the per-device daily DM cap.
+const DAY_SECS: i64 = 86_400;
+/// Upper bound on rate-limited actions held in memory awaiting a retry. Past
+/// this we report failure rather than grow without limit.
+const MAX_PENDING_ACTIONS: usize = 50;
+/// Cap on comments forwarded from a single scan.
+const MAX_COMMENTS: usize = 50;
+/// Recursion guard for the layered agent-output parser.
+const PARSE_MAX_DEPTH: u8 = 5;
+
 // ── Public types ──────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -46,6 +67,8 @@ pub struct BridgeStatus {
     pub jobs_done: u32,
     pub jobs_failed: u32,
     pub mobileuse_alive: bool,
+    pub scans_done: u32,
+    pub actions_done: u32,
 }
 
 /// Shared bridge state. Every field is an `Arc` so the polling task can hold a
@@ -60,6 +83,14 @@ pub struct BridgeState {
     jobs_failed: Arc<AtomicU32>,
     mobileuse_alive: Arc<AtomicBool>,
     last_poll: Arc<Mutex<Option<String>>>,
+    scans_done: Arc<AtomicU32>,
+    actions_done: Arc<AtomicU32>,
+    /// Unix timestamps of DMs sent, keyed by device. Drives the rate limiter.
+    dm_log: Arc<Mutex<HashMap<String, Vec<i64>>>>,
+    /// Approved actions we claimed but could not send yet because of the DM
+    /// rate limit. A claimed job is already popped off the VPS queue, so we own
+    /// it until it is either sent or explicitly reported failed.
+    pending_actions: Arc<Mutex<Vec<ActionJob>>>,
 }
 
 impl BridgeState {
@@ -77,6 +108,8 @@ impl BridgeState {
             jobs_done: self.jobs_done.load(Ordering::SeqCst),
             jobs_failed: self.jobs_failed.load(Ordering::SeqCst),
             mobileuse_alive: self.mobileuse_alive.load(Ordering::SeqCst),
+            scans_done: self.scans_done.load(Ordering::SeqCst),
+            actions_done: self.actions_done.load(Ordering::SeqCst),
         }
     }
 
@@ -85,6 +118,59 @@ impl BridgeState {
         match self.last_poll.lock() {
             Ok(mut guard) => *guard = Some(now),
             Err(poisoned) => *poisoned.into_inner() = Some(now),
+        }
+    }
+
+    /// Decide whether `device_id` may send a DM right now. Prunes expired
+    /// history as a side effect. Synchronous by design: the guard must never be
+    /// held across an `.await`.
+    fn dm_gate_for(&self, device_id: &str, cfg: &BridgeConfig, now: i64) -> DmGate {
+        let mut guard = match self.dm_log.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let history = guard.entry(device_id.to_string()).or_default();
+        history.retain(|t| *t > now - DAY_SECS);
+        dm_gate(history, now, cfg.max_dms_per_day, cfg.min_dm_delay_secs)
+    }
+
+    fn record_dm(&self, device_id: &str, now: i64) {
+        let mut guard = match self.dm_log.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let history = guard.entry(device_id.to_string()).or_default();
+        history.push(now);
+        history.retain(|t| *t > now - DAY_SECS);
+    }
+
+    fn take_pending_actions(&self) -> Vec<ActionJob> {
+        let mut guard = match self.pending_actions.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        std::mem::take(&mut *guard)
+    }
+
+    /// Hold a rate-limited action for a later tick. Returns false when the
+    /// holding pen is full, so the caller can report failure instead of
+    /// silently dropping an approved send.
+    fn defer_action(&self, job: ActionJob) -> bool {
+        let mut guard = match self.pending_actions.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if guard.len() >= MAX_PENDING_ACTIONS {
+            return false;
+        }
+        guard.push(job);
+        true
+    }
+
+    fn pending_action_count(&self) -> usize {
+        match self.pending_actions.lock() {
+            Ok(g) => g.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
         }
     }
 }
@@ -98,6 +184,9 @@ struct BridgeConfig {
     poll_interval_secs: u64,
     device_name: String,
     device_map: HashMap<String, String>,
+    max_dms_per_day: u32,
+    min_dm_delay_secs: i64,
+    actions_per_tick: usize,
 }
 
 fn store_string(app: &AppHandle, key: &str) -> Option<String> {
@@ -158,6 +247,21 @@ fn read_config(app: &AppHandle) -> BridgeConfig {
         .map(|raw| parse_device_map(&raw))
         .unwrap_or_default();
 
+    // Account-survival knobs. Same names and defaults as the VPS worker so the
+    // two halves cannot drift apart.
+    let max_dms_per_day = env_string("ENGAGEMENT_MAX_DMS_PER_DAY")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(5);
+    let min_dm_delay_secs = env_string("MIN_DELAY_BETWEEN_DMS_SECONDS")
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v >= 0)
+        .unwrap_or(300);
+
+    let actions_per_tick = env_string("BRIDGE_ACTIONS_PER_TICK")
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(3);
+
     BridgeConfig {
         vps_url: vps_url.trim_end_matches('/').to_string(),
         api_key,
@@ -165,6 +269,9 @@ fn read_config(app: &AppHandle) -> BridgeConfig {
         poll_interval_secs,
         device_name,
         device_map,
+        max_dms_per_day,
+        min_dm_delay_secs,
+        actions_per_tick,
     }
 }
 
@@ -186,6 +293,14 @@ fn url_encode(s: &str) -> String {
             }
             other => out.push_str(&format!("%{:02X}", other)),
         }
+    }
+    out
+}
+
+fn truncate(s: &str, max_chars: usize) -> String {
+    let mut out: String = s.chars().take(max_chars).collect();
+    if s.chars().count() > max_chars {
+        out.push('…');
     }
     out
 }
@@ -219,6 +334,34 @@ fn absolute_url(base: &str, maybe_relative: &str) -> String {
     }
 }
 
+/// First non-empty string among `keys` on a JSON object.
+fn json_str_field(item: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|k| {
+        item.get(*k)
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    })
+}
+
+/// An id the VPS may send as a string or a bare number; null becomes None.
+fn opt_id(v: &serde_json::Value, key: &str) -> Option<String> {
+    match v.get(key) {
+        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn normalize_handle(raw: &str) -> String {
+    raw.trim()
+        .trim_matches('"')
+        .trim()
+        .trim_start_matches('@')
+        .trim()
+        .to_string()
+}
+
 fn emit_log(app: &AppHandle, level: &str, message: impl Into<String>) {
     let message = message.into();
     if level == "error" {
@@ -240,6 +383,42 @@ fn emit_status(app: &AppHandle, state: &BridgeState) {
     let _ = app.emit("bridge-status", state.snapshot());
 }
 
+// ── Rate limiting ─────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DmGate {
+    Allow,
+    TooSoon { wait_secs: i64 },
+    DailyCap { used: usize, cap: u32 },
+}
+
+/// Pure rate-limit decision over a device's DM history (unix seconds).
+fn dm_gate(history: &[i64], now: i64, max_per_day: u32, min_delay_secs: i64) -> DmGate {
+    let recent: Vec<i64> = history
+        .iter()
+        .copied()
+        .filter(|t| *t > now - DAY_SECS)
+        .collect();
+
+    if recent.len() as u64 >= u64::from(max_per_day) {
+        return DmGate::DailyCap {
+            used: recent.len(),
+            cap: max_per_day,
+        };
+    }
+
+    if let Some(last) = recent.iter().copied().max() {
+        let elapsed = now.saturating_sub(last);
+        if elapsed < min_delay_secs {
+            return DmGate::TooSoon {
+                wait_secs: min_delay_secs - elapsed,
+            };
+        }
+    }
+
+    DmGate::Allow
+}
+
 // ── VPS job model ─────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -250,6 +429,33 @@ struct PostJob {
     store_url: Option<String>,
     utm: Option<String>,
     file_url: String,
+}
+
+#[derive(Clone, Debug)]
+struct EngagementJob {
+    clip_id: String,
+    platform: String,
+    device_id: Option<String>,
+    clip_url: Option<String>,
+    link: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ActionJob {
+    kind: String,
+    message_id: Option<String>,
+    clip_id: Option<String>,
+    engagement_id: Option<String>,
+    target_handle: String,
+    target_platform: String,
+    message: String,
+    comment_text: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+struct Comment {
+    username: String,
+    text: String,
 }
 
 fn parse_job(base: &str, body: &serde_json::Value) -> Option<PostJob> {
@@ -312,6 +518,249 @@ fn parse_job(base: &str, body: &serde_json::Value) -> Option<PostJob> {
     })
 }
 
+fn parse_engagement_job(body: &serde_json::Value) -> Option<EngagementJob> {
+    let job = body.get("job")?;
+    if job.is_null() {
+        return None;
+    }
+
+    let clip_id = json_str_field(job, &["clipId"])?;
+
+    Some(EngagementJob {
+        clip_id,
+        platform: json_str_field(job, &["platform"])
+            .map(|p| p.to_lowercase())
+            .unwrap_or_else(|| "tiktok".to_string()),
+        device_id: json_str_field(job, &["deviceId"]),
+        clip_url: json_str_field(job, &["clipUrl"]),
+        link: json_str_field(job, &["link"]),
+    })
+}
+
+fn parse_action_job(body: &serde_json::Value) -> Option<ActionJob> {
+    let job = body.get("job")?;
+    if job.is_null() {
+        return None;
+    }
+
+    // Without text there is nothing to type, so the job is unusable.
+    let message = json_str_field(job, &["message"])?;
+
+    Some(ActionJob {
+        kind: json_str_field(job, &["type"])
+            .map(|t| t.to_lowercase())
+            .unwrap_or_else(|| "reply".to_string()),
+        message_id: opt_id(job, "messageId"),
+        clip_id: opt_id(job, "clipId"),
+        engagement_id: opt_id(job, "engagementId"),
+        target_handle: json_str_field(job, &["targetHandle"])
+            .map(|h| normalize_handle(&h))
+            .unwrap_or_default(),
+        target_platform: json_str_field(job, &["targetPlatform"])
+            .map(|p| p.to_lowercase())
+            .unwrap_or_else(|| "tiktok".to_string()),
+        message,
+        comment_text: job.get("comment").and_then(|c| json_str_field(c, &["text"])),
+    })
+}
+
+// ── Agent output parsing ──────────────────────────────────────
+
+/// Words that look like a handle before a colon but are really prose labels.
+const LINE_STOPWORDS: &[&str] = &[
+    "note",
+    "notes",
+    "warning",
+    "error",
+    "result",
+    "results",
+    "output",
+    "comment",
+    "comments",
+    "summary",
+    "step",
+    "steps",
+    "action",
+    "actions",
+    "url",
+    "http",
+    "https",
+    "total",
+    "found",
+    "task",
+    "answer",
+    "username",
+    "text",
+];
+
+fn comment_from_object(item: &serde_json::Value) -> Option<Comment> {
+    let text = json_str_field(item, &["text", "comment", "message", "body", "content"])?;
+    let username =
+        json_str_field(item, &["username", "user", "author", "handle", "name", "from"])
+            .unwrap_or_default();
+    Some(Comment {
+        username: normalize_handle(&username),
+        text,
+    })
+}
+
+/// Last-resort parse of one line of prose, e.g. `@aya: how much is this?`.
+fn parse_comment_line(line: &str) -> Option<Comment> {
+    let line = line
+        .trim()
+        .trim_start_matches(|c: char| c == '-' || c == '*' || c == '•')
+        .trim();
+
+    // Drop a leading "1." / "2)" enumerator.
+    let line = match line.find(|c: char| !c.is_ascii_digit()) {
+        Some(idx) if idx > 0 && matches!(line[idx..].chars().next(), Some('.') | Some(')')) => {
+            line[idx + 1..].trim()
+        }
+        _ => line,
+    };
+
+    let (left, right) = match line.split_once(':') {
+        Some(pair) => pair,
+        None => line.split_once(" - ")?,
+    };
+
+    let username = normalize_handle(left);
+    let text = right.trim().trim_matches('"').trim().to_string();
+
+    if username.is_empty() || text.is_empty() {
+        return None;
+    }
+    // Real handles have no spaces; this is what rejects prose like
+    // "Here are the comments I found: ...".
+    if username.chars().any(char::is_whitespace) || username.chars().count() > 40 {
+        return None;
+    }
+    if LINE_STOPWORDS.contains(&username.to_lowercase().as_str()) {
+        return None;
+    }
+
+    Some(Comment { username, text })
+}
+
+fn extract_json_array(s: &str) -> Option<&str> {
+    let start = s.find('[')?;
+    let end = s.rfind(']')?;
+    if end > start {
+        Some(&s[start..=end])
+    } else {
+        None
+    }
+}
+
+fn comments_from_value(v: &serde_json::Value, depth: u8) -> Vec<Comment> {
+    if depth > PARSE_MAX_DEPTH {
+        return Vec::new();
+    }
+
+    match v {
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .filter_map(|item| match item {
+                serde_json::Value::String(s) => parse_comment_line(s),
+                other => comment_from_object(other),
+            })
+            .collect(),
+        serde_json::Value::Object(_) => {
+            // The agent usually wraps its answer; unwrap the common envelopes
+            // before giving up.
+            for key in [
+                "comments",
+                "data",
+                "items",
+                "results",
+                "result",
+                "output",
+                "response",
+                "content",
+                "message",
+                "text",
+                "answer",
+                "final_answer",
+            ] {
+                if let Some(child) = v.get(key) {
+                    let found = match child {
+                        serde_json::Value::String(s) => parse_comments_str(s, depth + 1),
+                        other => comments_from_value(other, depth + 1),
+                    };
+                    if !found.is_empty() {
+                        return found;
+                    }
+                }
+            }
+            comment_from_object(v).map(|c| vec![c]).unwrap_or_default()
+        }
+        serde_json::Value::String(s) => parse_comments_str(s, depth + 1),
+        _ => Vec::new(),
+    }
+}
+
+fn parse_comments_str(raw: &str, depth: u8) -> Vec<Comment> {
+    if depth > PARSE_MAX_DEPTH {
+        return Vec::new();
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    // 1. the whole payload is JSON.
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        match &v {
+            serde_json::Value::String(inner) => {
+                if inner != trimmed {
+                    let found = parse_comments_str(inner, depth + 1);
+                    if !found.is_empty() {
+                        return found;
+                    }
+                }
+            }
+            other => {
+                let found = comments_from_value(other, depth + 1);
+                if !found.is_empty() {
+                    return found;
+                }
+            }
+        }
+    }
+
+    // 2. a JSON array embedded in prose or a ``` fence.
+    if let Some(slice) = extract_json_array(trimmed) {
+        if slice != trimmed {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(slice) {
+                let found = comments_from_value(&v, depth + 1);
+                if !found.is_empty() {
+                    return found;
+                }
+            }
+        }
+    }
+
+    // 3. line by line.
+    trimmed.lines().filter_map(parse_comment_line).collect()
+}
+
+/// Turn free-form agent output into comments. Returns an empty vec rather than
+/// an error when nothing can be extracted — an empty scan is a valid result.
+fn parse_comments(raw: &str) -> Vec<Comment> {
+    let mut out: Vec<Comment> = Vec::new();
+    for c in parse_comments_str(raw, 0) {
+        if !out.iter().any(|e| e.username == c.username && e.text == c.text) {
+            out.push(c);
+        }
+        if out.len() >= MAX_COMMENTS {
+            break;
+        }
+    }
+    out
+}
+
+// ── Instructions ──────────────────────────────────────────────
+
 /// Append the tracked store link to the caption, substituting `{platform}` in
 /// the UTM string.
 fn build_caption(job: &PostJob, platform: &str) -> String {
@@ -354,16 +803,55 @@ fn build_instruction(platform: &str, video_path: &str, caption: &str) -> String 
     }
 }
 
+fn build_scan_instruction(platform: &str, clip_url: Option<&str>) -> String {
+    let open = match clip_url {
+        Some(url) if !url.trim().is_empty() => format!("Open this link on the device: {url}."),
+        _ => match platform {
+            "instagram" => "Open the Instagram app, go to your own profile, and open the most recent Reel you posted.".to_string(),
+            "youtube" => "Open the YouTube app, go to Your videos, and open the most recent Short you posted.".to_string(),
+            other => format!("Open the {other} app, go to your own profile, and open the most recent video you posted."),
+        },
+    };
+
+    format!(
+        "{open} Open the comment section and scroll slowly through it so the comments load. Read every comment you can see, including each commenter's username. This is a read-only task: do not reply, do not like, and do not follow anyone. Return ONLY a JSON array like [{{\"username\":\"someone\",\"text\":\"their comment\"}}] containing the comments you read, with no other text before or after it. If there are no comments, return exactly []."
+    )
+}
+
+fn build_reply_instruction(
+    platform: &str,
+    handle: &str,
+    comment_text: Option<&str>,
+    message: &str,
+) -> String {
+    let target = match comment_text {
+        Some(text) if !text.trim().is_empty() => {
+            format!("the comment from @{handle} that says \"{}\"", text.trim())
+        }
+        _ => format!("the comment from @{handle}"),
+    };
+
+    format!(
+        "Open the {platform} app, go to your own profile, and open the most recent video you posted. Open its comment section and find {target}. Tap Reply on that comment. Type exactly this reply and nothing else: {message}. Then send the reply. Do not send anything else."
+    )
+}
+
+fn build_dm_instruction(platform: &str, handle: &str, message: &str) -> String {
+    format!(
+        "Open the {platform} app and go to the direct messages inbox. Start a direct message to the user @{handle} (search for that exact username if you need to). Type exactly this message and nothing else: {message}. Then send it. Do not send anything else and do not message anyone else."
+    )
+}
+
 // ── VPS calls ─────────────────────────────────────────────────
 
-async fn claim_job(cfg: &BridgeConfig) -> Result<Option<PostJob>, String> {
+/// GET a `{ "job": ... }` envelope and hand the parsed body to `parse`.
+async fn claim<T>(
+    cfg: &BridgeConfig,
+    url: String,
+    label: &str,
+    parse: impl Fn(&serde_json::Value) -> Option<T>,
+) -> Result<Option<T>, String> {
     let http = client(20)?;
-    let url = format!(
-        "{}/api/bridge/posts/claim?device={}",
-        cfg.vps_url,
-        url_encode(&cfg.device_name)
-    );
-
     let mut req = http.get(&url);
     if !cfg.api_key.is_empty() {
         req = req.bearer_auth(&cfg.api_key);
@@ -372,25 +860,83 @@ async fn claim_job(cfg: &BridgeConfig) -> Result<Option<PostJob>, String> {
     let resp = req
         .send()
         .await
-        .map_err(|e| format!("VPS claim unreachable: {e}"))?;
+        .map_err(|e| format!("VPS {label} claim unreachable: {e}"))?;
     let status = resp.status();
     let body = resp
         .text()
         .await
-        .map_err(|e| format!("VPS claim body read failed: {e}"))?;
+        .map_err(|e| format!("VPS {label} claim body read failed: {e}"))?;
 
     if !status.is_success() {
         return Err(format!(
-            "VPS claim failed: http {} {}",
+            "VPS {label} claim failed: http {} {}",
             status.as_u16(),
-            body.chars().take(200).collect::<String>()
+            truncate(&body, 200)
         ));
     }
 
     let parsed: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| format!("VPS claim returned invalid JSON: {e}"))?;
+        .map_err(|e| format!("VPS {label} claim returned invalid JSON: {e}"))?;
 
-    Ok(parse_job(&cfg.vps_url, &parsed))
+    Ok(parse(&parsed))
+}
+
+async fn claim_job(cfg: &BridgeConfig) -> Result<Option<PostJob>, String> {
+    let url = format!(
+        "{}/api/bridge/posts/claim?device={}",
+        cfg.vps_url,
+        url_encode(&cfg.device_name)
+    );
+    let base = cfg.vps_url.clone();
+    claim(cfg, url, "post", |v| parse_job(&base, v)).await
+}
+
+async fn claim_engagement_job(cfg: &BridgeConfig) -> Result<Option<EngagementJob>, String> {
+    let url = format!("{}/api/bridge/engagement/claim", cfg.vps_url);
+    claim(cfg, url, "engagement", parse_engagement_job).await
+}
+
+async fn claim_action_job(cfg: &BridgeConfig) -> Result<Option<ActionJob>, String> {
+    let url = format!("{}/api/bridge/actions/claim", cfg.vps_url);
+    claim(cfg, url, "action", parse_action_job).await
+}
+
+/// POST a JSON body and return the `status` field the VPS echoes back.
+async fn post_result(
+    cfg: &BridgeConfig,
+    url: String,
+    label: &str,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let http = client(30)?;
+    let mut req = http.post(&url).json(&body);
+    if !cfg.api_key.is_empty() {
+        req = req.bearer_auth(&cfg.api_key);
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("VPS {label} post failed: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+
+    if !status.is_success() {
+        return Err(format!(
+            "VPS {label} post failed: http {} {}",
+            status.as_u16(),
+            truncate(&text, 200)
+        ));
+    }
+
+    Ok(serde_json::from_str::<serde_json::Value>(&text).unwrap_or(serde_json::Value::Null))
+}
+
+fn status_of(v: &serde_json::Value) -> String {
+    v.get("status")
+        .and_then(|s| s.as_str())
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 async fn download_clip(cfg: &BridgeConfig, job: &PostJob) -> Result<PathBuf, String> {
@@ -418,8 +964,7 @@ async fn download_clip(cfg: &BridgeConfig, job: &PostJob) -> Result<PathBuf, Str
     }
 
     let dir = std::env::temp_dir().join("clip4clicks");
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
 
     let path = dir.join(format!("{}.mp4", safe_file_stem(&job.clip_id)));
     std::fs::write(&path, &bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
@@ -432,45 +977,66 @@ async fn report_results(
     clip_id: &str,
     results: &[serde_json::Value],
 ) -> Result<String, String> {
-    let http = client(30)?;
     let url = format!(
         "{}/api/bridge/posts/{}/result",
         cfg.vps_url,
         url_encode(clip_id)
     );
+    let v = post_result(cfg, url, "post result", serde_json::json!({ "results": results })).await?;
+    Ok(status_of(&v))
+}
 
-    let mut req = http
-        .post(&url)
-        .json(&serde_json::json!({ "results": results }));
-    if !cfg.api_key.is_empty() {
-        req = req.bearer_auth(&cfg.api_key);
+async fn report_engagement(
+    cfg: &BridgeConfig,
+    job: &EngagementJob,
+    comments: &[Comment],
+) -> Result<String, String> {
+    let url = format!(
+        "{}/api/bridge/engagement/{}/result",
+        cfg.vps_url,
+        url_encode(&job.clip_id)
+    );
+    let body = serde_json::json!({
+        "comments": comments,
+        "platform": job.platform,
+        "link": job.link,
+    });
+    let v = post_result(cfg, url, "engagement result", body).await?;
+
+    let num = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+    Ok(format!(
+        "{} (scanned {}, matched {}, proposed {})",
+        status_of(&v),
+        num("scanned"),
+        num("matched"),
+        num("proposed")
+    ))
+}
+
+async fn report_action(
+    cfg: &BridgeConfig,
+    job: &ActionJob,
+    success: bool,
+    error: Option<&str>,
+) -> Result<String, String> {
+    let url = format!("{}/api/bridge/actions/result", cfg.vps_url);
+
+    // Echo back whichever identity fields the job carried so the VPS can find
+    // the right record.
+    let mut body = serde_json::json!({
+        "messageId": job.message_id,
+        "clipId": job.clip_id,
+        "engagementId": job.engagement_id,
+        "success": success,
+    });
+    if let Some(err) = error {
+        if let Some(map) = body.as_object_mut() {
+            map.insert("error".to_string(), serde_json::json!(err));
+        }
     }
 
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| format!("VPS result post failed: {e}"))?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-
-    if !status.is_success() {
-        return Err(format!(
-            "VPS result post failed: http {} {}",
-            status.as_u16(),
-            body.chars().take(200).collect::<String>()
-        ));
-    }
-
-    let reported = serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|v| {
-            v.get("status")
-                .and_then(|s| s.as_str())
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| "unknown".to_string());
-
-    Ok(reported)
+    let v = post_result(cfg, url, "action result", body).await?;
+    Ok(status_of(&v))
 }
 
 // ── Mobile-Use calls ──────────────────────────────────────────
@@ -545,7 +1111,11 @@ async fn fetch_devices(cfg: &BridgeConfig) -> Result<Vec<Device>, String> {
     Ok(parse_devices(&parsed))
 }
 
-async fn run_agent(cfg: &BridgeConfig, device_id: &str, instruction: &str) -> Result<String, String> {
+async fn run_agent(
+    cfg: &BridgeConfig,
+    device_id: &str,
+    instruction: &str,
+) -> Result<String, String> {
     // Agent runs drive a real phone and can take several minutes.
     let http = client(900)?;
     let url = format!(
@@ -568,12 +1138,13 @@ async fn run_agent(cfg: &BridgeConfig, device_id: &str, instruction: &str) -> Re
     let body = resp.text().await.unwrap_or_default();
 
     if status.is_success() {
-        Ok(body.chars().take(1000).collect::<String>())
+        // Generous cap: a comment scan returns its payload in this body.
+        Ok(truncate(&body, 8000))
     } else {
         Err(format!(
             "Mobile-Use agent http {}: {}",
             status.as_u16(),
-            body.chars().take(300).collect::<String>()
+            truncate(&body, 300)
         ))
     }
 }
@@ -585,22 +1156,19 @@ fn pick_device(cfg: &BridgeConfig, platform: &str, devices: &[Device]) -> Option
     devices.first().map(|d| d.id.clone())
 }
 
-// ── The tick ──────────────────────────────────────────────────
+// ── Stage 1: posts ────────────────────────────────────────────
 
-/// Claim + execute + report exactly one job. Returns a human-readable summary.
-async fn tick(app: &AppHandle, state: &BridgeState) -> Result<String, String> {
-    let cfg = read_config(app);
-    state.mark_poll();
-
-    let job = match claim_job(&cfg).await {
+async fn tick_posts(
+    app: &AppHandle,
+    state: &BridgeState,
+    cfg: &BridgeConfig,
+    devices: &[Device],
+) -> Result<String, String> {
+    let job = match claim_job(cfg).await {
         Ok(Some(job)) => job,
-        Ok(None) => {
-            emit_status(app, state);
-            return Ok("no jobs available".to_string());
-        }
+        Ok(None) => return Ok("posts idle".to_string()),
         Err(e) => {
             emit_log(app, "error", format!("claim failed: {e}"));
-            emit_status(app, state);
             return Err(e);
         }
     };
@@ -615,7 +1183,7 @@ async fn tick(app: &AppHandle, state: &BridgeState) -> Result<String, String> {
         ),
     );
 
-    let local_path = match download_clip(&cfg, &job).await {
+    let local_path = match download_clip(cfg, &job).await {
         Ok(path) => path,
         Err(e) => {
             // Tell the VPS every platform failed so the job is not stuck claimed.
@@ -624,32 +1192,19 @@ async fn tick(app: &AppHandle, state: &BridgeState) -> Result<String, String> {
                 .iter()
                 .map(|p| serde_json::json!({ "platform": p, "success": false, "error": e }))
                 .collect();
-            let _ = report_results(&cfg, &job.clip_id, &results).await;
+            let _ = report_results(cfg, &job.clip_id, &results).await;
             state.jobs_failed.fetch_add(1, Ordering::SeqCst);
             emit_log(app, "error", format!("download failed: {e}"));
-            emit_status(app, state);
             return Err(e);
         }
     };
     let local_path_str = local_path.to_string_lossy().to_string();
 
-    let devices = match fetch_devices(&cfg).await {
-        Ok(devices) => {
-            state.mobileuse_alive.store(true, Ordering::SeqCst);
-            devices
-        }
-        Err(e) => {
-            state.mobileuse_alive.store(false, Ordering::SeqCst);
-            emit_log(app, "error", format!("Mobile-Use device list: {e}"));
-            Vec::new()
-        }
-    };
-
     let mut results: Vec<serde_json::Value> = Vec::new();
     let mut succeeded = 0usize;
 
     for platform in &job.platforms {
-        let device_id = match pick_device(&cfg, platform, &devices) {
+        let device_id = match pick_device(cfg, platform, devices) {
             Some(id) => id,
             None => {
                 let err = format!("no device available for {platform}");
@@ -670,14 +1225,16 @@ async fn tick(app: &AppHandle, state: &BridgeState) -> Result<String, String> {
             format!("posting {} to {platform} on device {device_id}", job.clip_id),
         );
 
-        match run_agent(&cfg, &device_id, &instruction).await {
+        match run_agent(cfg, &device_id, &instruction).await {
             Ok(body) => {
                 succeeded += 1;
-                state.mobileuse_alive.store(true, Ordering::SeqCst);
                 emit_log(
                     app,
                     "info",
-                    format!("{platform}: agent finished — {}", body.replace('\n', " ")),
+                    format!(
+                        "{platform}: agent finished — {}",
+                        truncate(&body.replace('\n', " "), 300)
+                    ),
                 );
                 results.push(serde_json::json!({ "platform": platform, "success": true }));
             }
@@ -696,15 +1253,13 @@ async fn tick(app: &AppHandle, state: &BridgeState) -> Result<String, String> {
         state.jobs_failed.fetch_add(1, Ordering::SeqCst);
     }
 
-    let reported = match report_results(&cfg, &job.clip_id, &results).await {
+    let reported = match report_results(cfg, &job.clip_id, &results).await {
         Ok(status) => status,
         Err(e) => {
             emit_log(app, "error", format!("result report failed: {e}"));
             "unreported".to_string()
         }
     };
-
-    emit_status(app, state);
 
     let summary = format!(
         "clip {}: {}/{} platform(s) posted ({}) — VPS says {}",
@@ -715,6 +1270,350 @@ async fn tick(app: &AppHandle, state: &BridgeState) -> Result<String, String> {
         reported
     );
     emit_log(app, if all_ok { "info" } else { "error" }, summary.clone());
+    Ok(summary)
+}
+
+// ── Stage 2: engagement scans ─────────────────────────────────
+
+async fn tick_engagement(
+    app: &AppHandle,
+    state: &BridgeState,
+    cfg: &BridgeConfig,
+    devices: &[Device],
+) -> Result<String, String> {
+    let job = match claim_engagement_job(cfg).await {
+        Ok(Some(job)) => job,
+        Ok(None) => return Ok("scans idle".to_string()),
+        Err(e) => {
+            emit_log(app, "error", format!("engagement claim failed: {e}"));
+            return Err(e);
+        }
+    };
+
+    let device_id = match job
+        .device_id
+        .clone()
+        .or_else(|| pick_device(cfg, &job.platform, devices))
+    {
+        Some(id) => id,
+        None => {
+            let err = format!("no device available for {}", job.platform);
+            emit_log(app, "error", err.clone());
+            // Report an empty scan anyway so the VPS releases the claim.
+            let _ = report_engagement(cfg, &job, &[]).await;
+            return Err(err);
+        }
+    };
+
+    emit_log(
+        app,
+        "info",
+        format!(
+            "scanning comments on {} ({}) via device {device_id}",
+            job.clip_id, job.platform
+        ),
+    );
+
+    let instruction = build_scan_instruction(&job.platform, job.clip_url.as_deref());
+    let comments = match run_agent(cfg, &device_id, &instruction).await {
+        Ok(body) => {
+            state.scans_done.fetch_add(1, Ordering::SeqCst);
+            let parsed = parse_comments(&body);
+            if parsed.is_empty() {
+                emit_log(
+                    app,
+                    "info",
+                    format!(
+                        "scan of {} produced no parseable comments — {}",
+                        job.clip_id,
+                        truncate(&body.replace('\n', " "), 200)
+                    ),
+                );
+            }
+            parsed
+        }
+        Err(e) => {
+            // An empty result still has to go up so the job is not stuck.
+            emit_log(app, "error", format!("comment scan failed: {e}"));
+            Vec::new()
+        }
+    };
+
+    // Raw comments only. Matching and drafting are the VPS's job.
+    let reported = report_engagement(cfg, &job, &comments).await?;
+
+    let summary = format!(
+        "scan {}: {} comment(s) → VPS says {}",
+        job.clip_id,
+        comments.len(),
+        reported
+    );
+    emit_log(app, "info", summary.clone());
+    Ok(summary)
+}
+
+// ── Stage 3: approved actions ─────────────────────────────────
+
+enum ActionOutcome {
+    Sent,
+    Failed,
+    /// Rate-limited. Not a failure: the caller holds it for a later tick.
+    Deferred,
+}
+
+async fn execute_action(
+    app: &AppHandle,
+    state: &BridgeState,
+    cfg: &BridgeConfig,
+    devices: &[Device],
+    job: &ActionJob,
+) -> ActionOutcome {
+    let device_id = match pick_device(cfg, &job.target_platform, devices) {
+        Some(id) => id,
+        None => {
+            let err = format!("no device available for {}", job.target_platform);
+            emit_log(app, "error", err.clone());
+            let _ = report_action(cfg, job, false, Some(&err)).await;
+            return ActionOutcome::Failed;
+        }
+    };
+
+    let instruction = match job.kind.as_str() {
+        "dm" => {
+            if job.target_handle.is_empty() {
+                let err = "dm job has no targetHandle".to_string();
+                emit_log(app, "error", err.clone());
+                let _ = report_action(cfg, job, false, Some(&err)).await;
+                return ActionOutcome::Failed;
+            }
+
+            // Account-survival guard. A rate-limited DM is neither dropped nor
+            // reported failed — it is held and retried on a later tick.
+            match state.dm_gate_for(&device_id, cfg, chrono::Utc::now().timestamp()) {
+                DmGate::Allow => {}
+                DmGate::TooSoon { wait_secs } => {
+                    emit_log(
+                        app,
+                        "info",
+                        format!(
+                            "DM to @{} held: {wait_secs}s until device {device_id} may send again",
+                            job.target_handle
+                        ),
+                    );
+                    return ActionOutcome::Deferred;
+                }
+                DmGate::DailyCap { used, cap } => {
+                    emit_log(
+                        app,
+                        "info",
+                        format!(
+                            "DM to @{} held: device {device_id} is at its daily cap ({used}/{cap})",
+                            job.target_handle
+                        ),
+                    );
+                    return ActionOutcome::Deferred;
+                }
+            }
+
+            build_dm_instruction(&job.target_platform, &job.target_handle, &job.message)
+        }
+        "reply" => build_reply_instruction(
+            &job.target_platform,
+            &job.target_handle,
+            job.comment_text.as_deref(),
+            &job.message,
+        ),
+        other => {
+            let err = format!("unsupported action type '{other}'");
+            emit_log(app, "error", err.clone());
+            let _ = report_action(cfg, job, false, Some(&err)).await;
+            return ActionOutcome::Failed;
+        }
+    };
+
+    emit_log(
+        app,
+        "info",
+        format!(
+            "sending {} to @{} on {} via device {device_id}",
+            job.kind, job.target_handle, job.target_platform
+        ),
+    );
+
+    match run_agent(cfg, &device_id, &instruction).await {
+        Ok(body) => {
+            if job.kind == "dm" {
+                state.record_dm(&device_id, chrono::Utc::now().timestamp());
+            }
+            state.actions_done.fetch_add(1, Ordering::SeqCst);
+            emit_log(
+                app,
+                "info",
+                format!(
+                    "{} to @{} sent — {}",
+                    job.kind,
+                    job.target_handle,
+                    truncate(&body.replace('\n', " "), 200)
+                ),
+            );
+            if let Err(e) = report_action(cfg, job, true, None).await {
+                emit_log(app, "error", format!("action result report failed: {e}"));
+            }
+            ActionOutcome::Sent
+        }
+        Err(e) => {
+            emit_log(
+                app,
+                "error",
+                format!("{} to @{} failed: {e}", job.kind, job.target_handle),
+            );
+            let _ = report_action(cfg, job, false, Some(&e)).await;
+            ActionOutcome::Failed
+        }
+    }
+}
+
+async fn tick_actions(
+    app: &AppHandle,
+    state: &BridgeState,
+    cfg: &BridgeConfig,
+    devices: &[Device],
+) -> Result<String, String> {
+    let mut budget = cfg.actions_per_tick;
+    let mut sent = 0usize;
+    let mut failed = 0usize;
+    let mut deferred = 0usize;
+    let mut claim_error: Option<String> = None;
+
+    // Retries first. These were claimed on an earlier tick and are already off
+    // the VPS queue, so we owe them a send.
+    let mut queue = state.take_pending_actions();
+    queue.reverse(); // pop() then yields them oldest-first
+    let mut carried: Vec<ActionJob> = Vec::new();
+
+    loop {
+        let job = match queue.pop() {
+            Some(j) => j,
+            None => {
+                if budget == 0 {
+                    break;
+                }
+                match claim_action_job(cfg).await {
+                    Ok(Some(j)) => j,
+                    Ok(None) => break,
+                    Err(e) => {
+                        emit_log(app, "error", format!("action claim failed: {e}"));
+                        claim_error = Some(e);
+                        break;
+                    }
+                }
+            }
+        };
+
+        if budget == 0 {
+            carried.push(job);
+            continue;
+        }
+
+        match execute_action(app, state, cfg, devices, &job).await {
+            ActionOutcome::Sent => {
+                sent += 1;
+                budget -= 1;
+            }
+            ActionOutcome::Failed => {
+                failed += 1;
+                budget -= 1;
+            }
+            ActionOutcome::Deferred => carried.push(job),
+        }
+    }
+
+    for job in carried {
+        if state.defer_action(job.clone()) {
+            deferred += 1;
+        } else {
+            // Holding pen is full. Never lose an approved send silently: tell
+            // the VPS it failed so a human can re-approve it.
+            let err = format!("dropped: bridge retry queue is full ({MAX_PENDING_ACTIONS})");
+            emit_log(app, "error", err.clone());
+            let _ = report_action(cfg, &job, false, Some(&err)).await;
+            failed += 1;
+        }
+    }
+
+    let held = state.pending_action_count();
+    let summary = format!("actions: {sent} sent, {failed} failed, {deferred} held ({held} waiting)");
+    if sent > 0 || failed > 0 || deferred > 0 {
+        emit_log(
+            app,
+            if failed > 0 { "error" } else { "info" },
+            summary.clone(),
+        );
+    }
+
+    match claim_error {
+        Some(e) if sent == 0 && failed == 0 && deferred == 0 => Err(e),
+        _ => Ok(summary),
+    }
+}
+
+// ── The tick ──────────────────────────────────────────────────
+
+/// Drain all three queues once: posts, then engagement scans, then approved
+/// actions. Stages are independent — a failure in one never aborts the others.
+async fn tick(app: &AppHandle, state: &BridgeState) -> Result<String, String> {
+    let cfg = read_config(app);
+    state.mark_poll();
+
+    // One device probe per tick, shared by every stage. It keeps
+    // `mobileuse_alive` honest even on idle ticks, and stops us claiming work
+    // we have no phone to execute (a claimed job is already off the VPS queue).
+    let devices = match fetch_devices(&cfg).await {
+        Ok(devices) => {
+            state.mobileuse_alive.store(true, Ordering::SeqCst);
+            devices
+        }
+        Err(e) => {
+            state.mobileuse_alive.store(false, Ordering::SeqCst);
+            emit_log(app, "error", format!("Mobile-Use device list: {e}"));
+            emit_status(app, state);
+            return Err(e);
+        }
+    };
+
+    if devices.is_empty() && cfg.device_map.is_empty() {
+        let err = "no phones attached — nothing claimed this tick".to_string();
+        emit_log(app, "error", err.clone());
+        emit_status(app, state);
+        return Err(err);
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    match tick_posts(app, state, &cfg, &devices).await {
+        Ok(s) => parts.push(s),
+        Err(e) => errors.push(format!("posts: {e}")),
+    }
+    match tick_engagement(app, state, &cfg, &devices).await {
+        Ok(s) => parts.push(s),
+        Err(e) => errors.push(format!("engagement: {e}")),
+    }
+    match tick_actions(app, state, &cfg, &devices).await {
+        Ok(s) => parts.push(s),
+        Err(e) => errors.push(format!("actions: {e}")),
+    }
+
+    emit_status(app, state);
+
+    if parts.is_empty() {
+        return Err(errors.join("; "));
+    }
+
+    let mut summary = parts.join(" | ");
+    if !errors.is_empty() {
+        summary.push_str(&format!(" | errors: {}", errors.join("; ")));
+    }
     Ok(summary)
 }
 
@@ -811,6 +1710,8 @@ pub async fn bridge_tick_once(
 mod tests {
     use super::*;
 
+    // ── existing coverage ─────────────────────────────────────
+
     #[test]
     fn device_map_parses_pairs_and_ignores_junk() {
         let map = parse_device_map("tiktok:SER1, instagram:SER2 ,,broken,youtube:");
@@ -852,5 +1753,222 @@ mod tests {
         });
         let job = parse_job("http://vps:3000", &body).expect("job");
         assert_eq!(job.file_url, "http://vps:3000/api/bridge/clips/u-1/file");
+    }
+
+    // ── DM rate limiting ──────────────────────────────────────
+
+    #[test]
+    fn dm_gate_allows_first_send() {
+        assert_eq!(dm_gate(&[], 10_000, 5, 300), DmGate::Allow);
+    }
+
+    #[test]
+    fn dm_gate_blocks_until_min_delay_elapses() {
+        // 100s after the last DM, with a 300s floor.
+        assert_eq!(
+            dm_gate(&[9_900], 10_000, 5, 300),
+            DmGate::TooSoon { wait_secs: 200 }
+        );
+        // 300s after: the floor is satisfied.
+        assert_eq!(dm_gate(&[9_700], 10_000, 5, 300), DmGate::Allow);
+    }
+
+    #[test]
+    fn dm_gate_enforces_daily_cap() {
+        let history = [1_000, 2_000, 3_000, 4_000, 5_000];
+        assert_eq!(
+            dm_gate(&history, 10_000, 5, 300),
+            DmGate::DailyCap { used: 5, cap: 5 }
+        );
+    }
+
+    #[test]
+    fn dm_gate_ignores_sends_older_than_a_day() {
+        // Five sends, all more than 24h ago, plus nothing recent.
+        let now = 500_000;
+        let history = [1_000, 2_000, 3_000, 4_000, 5_000];
+        assert_eq!(dm_gate(&history, now, 5, 300), DmGate::Allow);
+    }
+
+    #[test]
+    fn dm_gate_daily_cap_takes_priority_over_delay() {
+        // At the cap and also inside the delay window: report the cap.
+        let history = [9_000, 9_200, 9_400, 9_600, 9_990];
+        assert_eq!(
+            dm_gate(&history, 10_000, 5, 300),
+            DmGate::DailyCap { used: 5, cap: 5 }
+        );
+    }
+
+    // ── comment parsing ───────────────────────────────────────
+
+    #[test]
+    fn comments_parse_from_clean_json() {
+        let out = parse_comments(r#"[{"username":"aya","text":"how much is this?"}]"#);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].username, "aya");
+        assert_eq!(out[0].text, "how much is this?");
+    }
+
+    #[test]
+    fn comments_parse_from_wrapped_agent_envelope() {
+        // Mobile-Use wraps the answer, and the answer is itself a JSON string.
+        let body = serde_json::json!({
+            "result": "[{\"username\":\"@bo\",\"text\":\"where to buy\"}]"
+        })
+        .to_string();
+        let out = parse_comments(&body);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].username, "bo"); // leading @ normalised away
+        assert_eq!(out[0].text, "where to buy");
+    }
+
+    #[test]
+    fn comments_parse_from_array_embedded_in_prose() {
+        let raw = "Sure! Here is what I found:\n```json\n[{\"username\":\"cy\",\"text\":\"link?\"}]\n```\nLet me know if you need more.";
+        let out = parse_comments(raw);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].username, "cy");
+    }
+
+    #[test]
+    fn comments_fall_back_to_line_parsing() {
+        let raw = "- @aya: how much is this?\n2. bo - where do I buy\n@cy: link please";
+        let out = parse_comments(raw);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].username, "aya");
+        assert_eq!(out[1].username, "bo");
+        assert_eq!(out[2].username, "cy");
+    }
+
+    #[test]
+    fn prose_only_output_yields_no_comments() {
+        let raw = "Note: I could not open the comment section.\nWarning: the app crashed twice.\nHere are the comments I found: none at all";
+        assert!(parse_comments(raw).is_empty());
+    }
+
+    #[test]
+    fn empty_json_array_yields_no_comments() {
+        assert!(parse_comments("[]").is_empty());
+        assert!(parse_comments("").is_empty());
+        assert!(parse_comments("   \n  ").is_empty());
+    }
+
+    #[test]
+    fn comments_are_deduplicated_and_capped() {
+        let dup = r#"[{"username":"a","text":"x"},{"username":"a","text":"x"}]"#;
+        assert_eq!(parse_comments(dup).len(), 1);
+
+        let many: Vec<serde_json::Value> = (0..80)
+            .map(|i| serde_json::json!({ "username": format!("u{i}"), "text": "hi" }))
+            .collect();
+        let out = parse_comments(&serde_json::json!(many).to_string());
+        assert_eq!(out.len(), MAX_COMMENTS);
+    }
+
+    #[test]
+    fn comment_entries_without_text_are_skipped() {
+        let raw = r#"[{"username":"a"},{"username":"b","text":"real"}]"#;
+        let out = parse_comments(raw);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].username, "b");
+    }
+
+    // ── job parsing ───────────────────────────────────────────
+
+    #[test]
+    fn engagement_job_parses_and_handles_nulls() {
+        assert!(parse_engagement_job(&serde_json::json!({ "job": null })).is_none());
+
+        let body = serde_json::json!({
+            "job": {
+                "clipId": "c-1",
+                "platform": "TikTok",
+                "deviceId": null,
+                "clipUrl": null,
+                "link": "https://shop.example/p/1"
+            }
+        });
+        let job = parse_engagement_job(&body).expect("job");
+        assert_eq!(job.clip_id, "c-1");
+        assert_eq!(job.platform, "tiktok"); // lowercased
+        assert!(job.device_id.is_none());
+        assert!(job.clip_url.is_none());
+        assert_eq!(job.link.as_deref(), Some("https://shop.example/p/1"));
+    }
+
+    #[test]
+    fn action_job_parses_dm_with_null_identity_fields() {
+        let body = serde_json::json!({
+            "job": {
+                "type": "dm",
+                "messageId": "m-1",
+                "clipId": null,
+                "engagementId": null,
+                "targetHandle": "@aya",
+                "targetPlatform": "TikTok",
+                "message": "hey! it's $29 — link in bio",
+                "comment": null
+            }
+        });
+        let job = parse_action_job(&body).expect("job");
+        assert_eq!(job.kind, "dm");
+        assert_eq!(job.message_id.as_deref(), Some("m-1"));
+        assert!(job.clip_id.is_none());
+        assert!(job.engagement_id.is_none());
+        assert_eq!(job.target_handle, "aya"); // @ stripped
+        assert_eq!(job.target_platform, "tiktok");
+        assert!(job.comment_text.is_none());
+    }
+
+    #[test]
+    fn action_job_carries_comment_text_for_replies() {
+        let body = serde_json::json!({
+            "job": {
+                "type": "reply",
+                "messageId": null,
+                "clipId": "c-9",
+                "engagementId": "e-9",
+                "targetHandle": "bo",
+                "targetPlatform": "instagram",
+                "message": "$29, link in bio!",
+                "comment": { "username": "bo", "text": "how much?" }
+            }
+        });
+        let job = parse_action_job(&body).expect("job");
+        assert_eq!(job.kind, "reply");
+        assert_eq!(job.clip_id.as_deref(), Some("c-9"));
+        assert_eq!(job.engagement_id.as_deref(), Some("e-9"));
+        assert_eq!(job.comment_text.as_deref(), Some("how much?"));
+
+        let instruction = build_reply_instruction(
+            &job.target_platform,
+            &job.target_handle,
+            job.comment_text.as_deref(),
+            &job.message,
+        );
+        assert!(instruction.contains("how much?"));
+        assert!(instruction.contains("$29, link in bio!"));
+    }
+
+    #[test]
+    fn action_job_without_message_is_rejected() {
+        let body = serde_json::json!({
+            "job": { "type": "dm", "targetHandle": "aya", "targetPlatform": "tiktok" }
+        });
+        assert!(parse_action_job(&body).is_none());
+        assert!(parse_action_job(&serde_json::json!({ "job": null })).is_none());
+    }
+
+    #[test]
+    fn scan_instruction_demands_json_and_stays_read_only() {
+        let with_url = build_scan_instruction("tiktok", Some("https://tiktok.com/@x/video/1"));
+        assert!(with_url.contains("https://tiktok.com/@x/video/1"));
+        assert!(with_url.contains("JSON array"));
+        assert!(with_url.contains("do not reply"));
+
+        let without_url = build_scan_instruction("instagram", None);
+        assert!(without_url.contains("Instagram"));
+        assert!(without_url.contains("[]"));
     }
 }
