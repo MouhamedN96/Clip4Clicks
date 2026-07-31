@@ -883,13 +883,57 @@ app.use('/api/bridge', requireBridgeAuth);
 // downloads the clip file, and REPORTS results back. Enabled by POST_EXECUTOR=desktop
 // (the VPS worker then skips the post_queue consumer — see worker/index.js).
 
-// Claim the next approved post job (atomic RPOP off post_queue). Marks the clip
+// ---- claim leases (a claimed job is off the queue; if the desktop dies before
+// reporting, the work would be lost — so every claim is leased and reclaimed) ----
+//
+// Design: on claim we RPOP the queue and park the job in a per-queue sorted set
+// scored by its expiry. Every claim first sweeps expired leases back onto the
+// queue, so recovery needs no cron — the desktop's own polling drives it.
+// Results release the lease by matching the job's identity (clipId/messageId),
+// so the desktop needs no lease token and required no client changes.
+const LEASE_SECS = Number(process.env.BRIDGE_LEASE_SECONDS) || 1800; // agent runs are slow
+const inflightKey = (queue) => `${queue}:inflight`;
+
+async function sweepExpiredLeases(queue) {
+    const key = inflightKey(queue);
+    const now = Date.now();
+    const expired = await redis.zrangebyscore(key, '-inf', now);
+    for (const payload of expired) {
+        // Re-queue then drop the lease. Ordering favors a duplicate delivery over
+        // a lost job if we crash between the two.
+        await redis.lpush(queue, payload);
+        await redis.zrem(key, payload);
+        console.warn(`Bridge lease expired, requeued a ${queue} job`);
+    }
+    return expired.length;
+}
+
+// Pop the next job, leasing it. Returns the parsed job (or null when empty).
+async function claimWithLease(queue) {
+    await sweepExpiredLeases(queue);
+    const raw = await redis.rpop(queue);
+    if (!raw) return null;
+    await redis.zadd(inflightKey(queue), Date.now() + LEASE_SECS * 1000, raw);
+    try { return JSON.parse(raw); } catch { return null; }
+}
+
+// Release a lease once the desktop reports. `match` identifies the job.
+async function releaseLease(queue, match) {
+    const key = inflightKey(queue);
+    const entries = await redis.zrange(key, 0, -1);
+    for (const payload of entries) {
+        let job; try { job = JSON.parse(payload); } catch { continue; }
+        if (match(job)) { await redis.zrem(key, payload); return true; }
+    }
+    return false;
+}
+
+// Claim the next approved post job (leased RPOP off post_queue). Marks the clip
 // 'posting' and returns the job plus a file URL the desktop downloads from.
 app.get('/api/bridge/posts/claim', async (req, res) => {
     try {
-        const raw = await redis.rpop('post_queue');
-        if (!raw) return res.json({ job: null });
-        const job = JSON.parse(raw);
+        const job = await claimWithLease('post_queue');
+        if (!job) return res.json({ job: null });
         if (job.clipId) {
             const c = await pool.connect();
             try {
@@ -946,6 +990,7 @@ app.post('/api/bridge/posts/:clipId/result', async (req, res) => {
             return res.status(400).json({ error: 'results array required' });
         }
         const anyPosted = results.some(r => r && r.success);
+        await releaseLease('post_queue', (j) => j.clipId === req.params.clipId);
         const c = await pool.connect();
         try {
             await c.query(
@@ -975,9 +1020,8 @@ app.post('/api/bridge/posts/:clipId/result', async (req, res) => {
 // Claim the next comment-scan job.
 app.get('/api/bridge/engagement/claim', async (req, res) => {
     try {
-        const raw = await redis.rpop('engagement_queue');
-        if (!raw) return res.json({ job: null });
-        res.json({ job: JSON.parse(raw) });
+        const job = await claimWithLease('engagement_queue');
+        res.json({ job: job || null });
     } catch (error) {
         console.error('Bridge engagement claim error:', error);
         res.status(500).json({ error: 'Failed to claim engagement job' });
@@ -995,6 +1039,7 @@ app.post('/api/bridge/engagement/:clipId/result', async (req, res) => {
             return res.status(400).json({ error: 'comments array required' });
         }
 
+        await releaseLease('engagement_queue', (j) => j.clipId === req.params.clipId);
         const matched = engagementProducer.matchKeywords(comments);
         const c = await pool.connect();
         try {
@@ -1040,9 +1085,8 @@ app.post('/api/bridge/engagement/:clipId/result', async (req, res) => {
 
 app.get('/api/bridge/actions/claim', async (req, res) => {
     try {
-        const raw = await redis.rpop('outreach_queue');
-        if (!raw) return res.json({ job: null });
-        res.json({ job: JSON.parse(raw) });
+        const job = await claimWithLease('outreach_queue');
+        res.json({ job: job || null });
     } catch (error) {
         console.error('Bridge action claim error:', error);
         res.status(500).json({ error: 'Failed to claim action' });
@@ -1053,6 +1097,9 @@ app.get('/api/bridge/actions/claim', async (req, res) => {
 app.post('/api/bridge/actions/result', async (req, res) => {
     try {
         const { messageId, clipId, engagementId, success, error: errMsg } = req.body || {};
+        await releaseLease('outreach_queue', (j) =>
+            (messageId && j.messageId === messageId) ||
+            (engagementId && j.engagementId === engagementId));
         const c = await pool.connect();
         try {
             // Cold-outreach rows live in outreach_messages.
