@@ -31,6 +31,10 @@ services:
       - config/.env
     volumes:
       - ./src:/app/src
+      # scripts/ is COPYed into the image at build time; mounting it too means
+      # preflight/smoke edits take effect on `git pull` without an image rebuild
+      # (they silently ran stale otherwise).
+      - ./scripts:/app/scripts
       - ./config:/app/config
       - clipforge-data:/app/data
     depends_on:
