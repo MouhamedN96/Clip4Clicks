@@ -19,6 +19,7 @@ pub fn run() {
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // Initialize local SQLite database
             let app_dir = app
@@ -56,6 +57,7 @@ pub fn run() {
             commands::queue_clip,
             commands::get_clip_status,
             commands::render_clip,
+            commands::upload_and_produce,
             commands::get_products,
             commands::get_analytics,
             commands::check_vps_health,

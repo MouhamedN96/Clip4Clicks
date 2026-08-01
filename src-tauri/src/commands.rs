@@ -120,6 +120,75 @@ pub async fn render_clip(clip_id: String, source_url: String) -> Result<String, 
         .map_err(|e| e.to_string())
 }
 
+/// Human-readable byte size for the summary line.
+fn fmt_bytes(n: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = n as f64;
+    if b >= GB {
+        format!("{:.2} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else {
+        format!("{:.0} KB", (b / 1024.0).max(1.0))
+    }
+}
+
+/// Take footage sitting on this machine and put it through the VPS pipeline.
+///
+/// The desktop's local ffmpeg path is a fixed-window placeholder — no highlight
+/// scoring, no captions — so a local file is uploaded and produced by the VPS
+/// exactly like any other source. Bytes are read and POSTed here in Rust rather
+/// than marshalled through the JS bridge: these files run to hundreds of MB.
+#[tauri::command]
+pub async fn upload_and_produce(
+    app: AppHandle,
+    path: String,
+    platforms: Vec<String>,
+) -> Result<String, String> {
+    if path.trim().is_empty() {
+        return Err("No file selected.".to_string());
+    }
+
+    let (vps_url, api_key) = read_conn(&app);
+    if vps_url.trim().is_empty() {
+        return Err("No VPS URL configured — set it in Settings.".to_string());
+    }
+    if api_key.is_empty() {
+        return Err("No API key configured — set it in Settings.".to_string());
+    }
+
+    let platforms = if platforms.is_empty() {
+        vec!["tiktok".to_string()]
+    } else {
+        platforms
+    };
+
+    let file = std::path::PathBuf::from(&path);
+    let filename = file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("upload.mp4")
+        .to_string();
+
+    let bytes = tokio::fs::read(&file)
+        .await
+        .map_err(|e| format!("Can't read {filename}: {e}"))?;
+    if bytes.is_empty() {
+        return Err(format!("{filename} is empty — nothing to upload."));
+    }
+    let size = bytes.len() as u64;
+
+    let source_path = api::upload_source(&vps_url, &api_key, &filename, bytes).await?;
+    api::generate_from_source(&vps_url, &api_key, &source_path, &platforms).await?;
+
+    Ok(format!(
+        "Uploaded {} → queued for production on {}",
+        fmt_bytes(size),
+        platforms.join(", ")
+    ))
+}
+
 // ── Products (from VPS API) ───────────────────────────────────
 
 #[tauri::command]

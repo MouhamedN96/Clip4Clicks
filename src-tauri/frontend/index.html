@@ -145,6 +145,25 @@
   .sw input:checked ~ .track{background:color-mix(in srgb,var(--accent) 55%,var(--raise))}
   .sw input:checked ~ .knob{left:21px; background:#fff}
 
+  /* produce · local file → VPS upload (additive, scoped to #sec-produce) */
+  .up-sep{margin-top:1.1rem; padding-top:1.1rem; border-top:1px solid var(--line)}
+  .up-lbl{font-size:.85rem; color:var(--text)}
+  .up-pick{display:flex; align-items:center; gap:.6rem; min-height:42px}
+  .up-name{font-family:var(--font-mono); font-size:.78rem; color:var(--faint); flex:1; min-width:0;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+  .up-name.set{color:var(--text)}
+  .up-x{background:transparent; border:1px solid var(--line); color:var(--muted); border-radius:5px;
+    width:28px; height:28px; flex:0 0 28px; padding:0; line-height:1; font-size:.8rem}
+  .up-x:hover{color:var(--text); border-color:var(--muted)}
+  .up-x[hidden]{display:none}
+  #upPlats{margin-top:.25rem}
+  #sec-produce .btn:disabled,#sec-produce .up-x:disabled{opacity:.5; cursor:default}
+  @media (pointer:coarse){
+    #sec-produce .btn{min-height:44px} #sec-produce .pchip{min-height:44px}
+    .up-x{width:44px; height:44px; flex:0 0 44px}
+  }
+  @media (prefers-reduced-motion:reduce){ #sec-produce *{transition:none !important} }
+
   /* analytics */
   .stats{display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:1px; background:var(--line); border:1px solid var(--line); border-radius:8px; overflow:hidden}
   .stat{background:var(--panel); padding:1.3rem 1.1rem}
@@ -254,6 +273,26 @@
             <button class="btn btn-primary" id="queueBtn" type="button" style="height:42px">Queue</button>
           </div>
           <div class="field" style="margin-top:.2rem"><span class="hint">Queued sources render locally (yt-dlp + ffmpeg → vertical 1080×1920), then land in Review.</span></div>
+
+          <div class="up-sep">
+            <span class="lbl">Or a video on this machine</span>
+            <div class="row-inline" style="margin-top:.9rem">
+              <div class="field">
+                <span class="up-lbl">Local video</span>
+                <div class="up-pick">
+                  <button class="btn btn-ghost" id="pickFileBtn" type="button">Choose video…</button>
+                  <span class="up-name" id="localFileName">No file chosen</span>
+                  <button class="up-x" id="clearFileBtn" type="button" aria-label="Clear the selected video" hidden>✕</button>
+                </div>
+              </div>
+              <div class="field" style="max-width:260px">
+                <span class="up-lbl" id="upPlatsLabel">Platforms</span>
+                <div class="plats" id="upPlats" role="group" aria-labelledby="upPlatsLabel"></div>
+              </div>
+              <button class="btn btn-primary" id="uploadBtn" type="button" style="height:42px" disabled>Upload &amp; produce</button>
+            </div>
+            <div class="field" style="margin-top:.6rem"><span class="hint" id="uploadHint" role="status" aria-live="polite"></span></div>
+          </div>
         </div>
         <div class="card">
           <span class="lbl">Local render queue</span>
@@ -388,6 +427,7 @@
       case "sync_with_vps": return Promise.resolve(mockClips.pending.length);
       case "queue_clip": return Promise.resolve("clip_"+Math.random().toString(36).slice(2,8));
       case "render_clip": return Promise.resolve("~/Videos/clip4clicks/"+(args.clipId||"clip")+"/clip.mp4");
+      case "upload_and_produce": return Promise.reject("no desktop backend in demo mode");
       case "approve_clip": moveMock(args.clipId,"approved"); return Promise.resolve(null);
       case "reject_clip": moveMock(args.clipId,null); return Promise.resolve(null);
       default: return Promise.resolve(null);
@@ -566,6 +606,93 @@
     });
   }
 
+  /* ---- produce · local file → VPS ----
+     The desktop's local render is a fixed-window placeholder (no scoring, no
+     captions), so a file on this laptop is uploaded and produced by the VPS like
+     any other source. The bytes never touch JS: we hand Rust a path and it reads
+     + POSTs the file itself — these run to hundreds of MB. */
+  var dlg = (T && T.dialog && typeof T.dialog.open==="function") ? T.dialog : null;
+  var canPick = LIVE && !!dlg;
+  var localPath="", localName="", uploading=false;
+  var upSel = new Set(["tiktok","youtube"]);
+
+  function renderUploadPlatforms(){
+    var el=$("upPlats"); el.innerHTML="";
+    PLATFORMS.forEach(function(p){
+      var b=document.createElement("button");
+      b.type="button"; b.className="pchip"+(upSel.has(p)?" on":"");
+      b.textContent=p; b.setAttribute("aria-pressed", upSel.has(p)?"true":"false");
+      b.addEventListener("click",function(){
+        if(uploading) return;
+        if(upSel.has(p)) upSel.delete(p); else upSel.add(p);
+        b.classList.toggle("on", upSel.has(p));
+        b.setAttribute("aria-pressed", upSel.has(p)?"true":"false");
+      });
+      el.appendChild(b);
+    });
+  }
+
+  function uploadHint(){
+    if(uploading) return "Uploading "+localName+" — big files take a while. Leave the app open.";
+    if(!LIVE) return "Local upload needs the desktop app — the picker is unavailable in demo mode.";
+    if(!dlg) return "File picker unavailable in this build.";
+    return "The file is uploaded to the VPS, which scores highlights and burns captions. The clip lands in Review.";
+  }
+
+  function setUploadBusy(busy){
+    uploading=!!busy;
+    var up=$("uploadBtn");
+    up.disabled = uploading || !localPath || !canPick;
+    up.textContent = uploading ? "Uploading…" : "Upload & produce";
+    $("pickFileBtn").disabled = uploading || !canPick;
+    $("clearFileBtn").hidden = uploading || !localPath;
+    $("uploadHint").textContent = uploadHint();
+  }
+
+  function clearLocalFile(){
+    localPath=""; localName="";
+    $("localFileName").textContent = canPick ? "No file chosen" : "Picker unavailable";
+    $("localFileName").classList.remove("set");
+    setUploadBusy(false);
+  }
+
+  function pickLocalFile(){
+    if(!canPick){ toast("The file picker needs the desktop app",1); return; }
+    Promise.resolve(dlg.open({multiple:false, filters:[{name:"Video", extensions:["mp4","mov","m4v","webm","mkv"]}]}))
+      .then(function(sel){
+        if(sel==null || sel==="") return;                       // operator cancelled
+        var p = (typeof sel==="string") ? sel
+              : Array.isArray(sel) ? sel[0]
+              : (sel && (sel.path || sel.name));
+        if(!p){ toast("Couldn't read that selection",1); return; }
+        localPath = String(p);
+        localName = localPath.split(/[\\/]/).pop() || localPath;
+        $("localFileName").textContent = localName;
+        $("localFileName").classList.add("set");
+        setUploadBusy(false);
+      })
+      .catch(function(e){ toast("File picker failed: "+e,1); });
+  }
+
+  function startUpload(){
+    if(uploading) return;
+    if(!localPath){ toast("Choose a video first",1); return; }
+    var plats=Array.from(upSel);
+    if(!plats.length){ toast("Pick at least one platform",1); return; }
+    var name=localName;
+    setUploadBusy(true);
+    call("upload_and_produce",{path:localPath, platforms:plats}).then(function(msg){
+      setUploadBusy(false); clearLocalFile();
+      renderQueue.unshift({id:"up_"+Date.now(), url:"local upload → VPS", title:name, status:"producing on VPS"});
+      renderProduce(); loadBadges();
+      toast(esc(String(msg||"Uploaded → queued for production")));
+    }).catch(function(e){ setUploadBusy(false); toast("Upload failed: "+e,1); });
+  }
+
+  $("pickFileBtn").addEventListener("click", pickLocalFile);
+  $("clearFileBtn").addEventListener("click", function(){ if(!uploading) clearLocalFile(); });
+  $("uploadBtn").addEventListener("click", startUpload);
+
   // ---- analytics ----
   function loadAnalytics(){ call("get_analytics").then(function(a){
     var cards=[["Total clips",a.total_clips,false],["Pending",a.pending,true],["Approved",a.approved,false],["Posted",a.posted,false],["Today",a.today_count,false]];
@@ -705,6 +832,7 @@
   $("brLog").innerHTML='<div class="none">Waiting for bridge activity…</div>';
   subscribeBridge();
   if(!LIVE) seedBridgeDemo();
+  renderUploadPlatforms(); clearLocalFile();
   loadSettings(); loadReview(); renderProduce(); loadBridge(); loadBridgeDevices();
 })();
 </script>

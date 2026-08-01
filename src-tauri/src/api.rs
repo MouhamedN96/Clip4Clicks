@@ -159,6 +159,108 @@ pub async fn reject_clip_remote(
     }
 }
 
+// ── Local-file upload → production ────────────────────────────
+// The operator picks a file on this machine; the VPS is what actually produces
+// (highlight scoring + burned captions), so the bytes go up rather than the
+// render coming down. Two hops, both bearer-authed:
+//   POST /api/bridge/upload?filename=…  <- raw bytes  -> { sourcePath }
+//   POST /api/clips/generate            <- { sourcePath, platforms }
+
+/// Percent-encode a filename for use in a query string. Only unreserved
+/// characters survive; everything else (spaces, `&`, non-ASCII) is escaped, so a
+/// weird filename can't rewrite the query.
+fn encode_query_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Upload raw video bytes; returns the server-side `sourcePath` to produce from.
+pub async fn upload_source(
+    vps_url: &str,
+    api_key: &str,
+    filename: &str,
+    bytes: Vec<u8>,
+) -> Result<String, String> {
+    // Uploads are big and the link may be slow — give this its own long budget.
+    let c = client(1800)?;
+    let url = format!(
+        "{}/api/bridge/upload?filename={}",
+        base(vps_url),
+        encode_query_value(filename)
+    );
+    let mut req = c
+        .post(&url)
+        .header(reqwest::header::CONTENT_TYPE, "video/mp4")
+        .body(bytes);
+    if !api_key.is_empty() {
+        req = req.bearer_auth(api_key);
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("upload failed: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "upload failed: http {} {}",
+            status.as_u16(),
+            text.chars().take(200).collect::<String>()
+        ));
+    }
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("upload returned invalid JSON: {e}"))?;
+    parsed
+        .get("sourcePath")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .ok_or_else(|| "upload response had no sourcePath".to_string())
+}
+
+/// Ask the VPS to produce a clip from a path that already lives on the VPS.
+pub async fn generate_from_source(
+    vps_url: &str,
+    api_key: &str,
+    source_path: &str,
+    platforms: &[String],
+) -> Result<(), String> {
+    let c = client(60)?;
+    let url = format!("{}/api/clips/generate", base(vps_url));
+    let mut req = c.post(&url).json(&serde_json::json!({
+        "sourcePath": source_path,
+        "platforms": platforms,
+    }));
+    if !api_key.is_empty() {
+        req = req.bearer_auth(api_key);
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("produce request failed: {e}"))?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let text = resp.text().await.unwrap_or_default();
+    Err(format!(
+        "produce request failed: http {} {}",
+        status.as_u16(),
+        text.chars().take(200).collect::<String>()
+    ))
+}
+
 // ── Products (VPS scaffold; not used by the operator UI yet) ───
 
 pub async fn get_products(vps_url: &str) -> Result<serde_json::Value, String> {

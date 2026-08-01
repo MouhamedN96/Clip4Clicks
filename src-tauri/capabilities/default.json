@@ -9,6 +9,7 @@
     "store:default",
     "http:default",
     "notification:default",
-    "fs:default"
+    "fs:default",
+    "dialog:allow-open"
   ]
 }
