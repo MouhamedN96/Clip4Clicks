@@ -79,6 +79,12 @@
   .thumb{width:96px; aspect-ratio:9/16; border-radius:5px; overflow:hidden; position:relative; border:1px solid var(--line)}
   /* Clickable thumb → opens the preview. Approving a clip you can't watch makes
      the human gate a rubber stamp, so playback is part of the review flow. */
+  /* keyboard-driven review: the operator works through 30-90 of these a day, so
+     the queue is navigable without the mouse (J/K, A approve, R reject, Space preview). */
+  .clip.sel{border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset}
+  .kbhint{font-family:var(--font-mono); font-size:.68rem; color:var(--faint); margin-bottom:.7rem; letter-spacing:.02em}
+  .kbhint b{color:var(--muted); font-weight:600; background:var(--panel-2); border:1px solid var(--line);
+    border-radius:3px; padding:.05rem .3rem; margin:0 .1rem}
   .thumb.playable{cursor:pointer; border:0; padding:0; transition:transform .18s ease, box-shadow .18s ease}
   .thumb.playable:hover{transform:translateY(-2px); box-shadow:0 8px 20px -10px rgba(0,0,0,.7)}
   .thumb.playable:focus-visible{outline:2px solid var(--accent); outline-offset:2px}
@@ -179,7 +185,9 @@
   /* toast */
   #toast{position:fixed; bottom:20px; left:50%; transform:translateX(-50%) translateY(20px); opacity:0;
     background:var(--panel-2); border:1px solid var(--line); border-radius:8px; padding:.7rem 1.1rem; font-size:.88rem;
-    box-shadow:0 12px 40px -12px rgba(0,0,0,.6); transition:.25s; z-index:50; max-width:80vw}
+    box-shadow:0 12px 40px -12px rgba(0,0,0,.6); transition:.25s; z-index:70; max-width:80vw}
+  /* z-index must stay ABOVE the preview modal (60): an approve/reject failure
+     while the video is open was rendering behind it, i.e. invisible. */
   #toast.show{opacity:1; transform:translateX(-50%) translateY(0)}
   #toast.err{border-color:color-mix(in srgb,var(--warn) 50%,var(--line))}
   #toast b{color:var(--accent)}
@@ -258,6 +266,7 @@
           <button class="tab" data-tab="approved" type="button">Approved <span class="n" id="tApproved">0</span></button>
           <button class="tab" data-tab="posted" type="button">Posted <span class="n" id="tPosted">0</span></button>
         </div>
+        <div class="kbhint"><b>J</b><b>K</b> move · <b>Space</b> preview · <b>A</b> approve · <b>R</b> reject</div>
         <div class="clips" id="clipList"></div>
       </section>
 
@@ -481,6 +490,19 @@
     renderClips();
   }).catch(function(e){ toast("Couldn't load queue: "+e,1); }); }
 
+  // "2026-07-31T02:05:04.873Z" is unreadable at a glance; the operator only ever
+  // cares how fresh a clip is.
+  function ago(ts){
+    if(!ts) return "";
+    var t = Date.parse(ts); if(isNaN(t)) return String(ts);
+    var s = Math.max(0, (Date.now() - t) / 1000);
+    if(s < 60)    return "just now";
+    if(s < 3600)  return Math.floor(s/60) + "m ago";
+    if(s < 86400) return Math.floor(s/3600) + "h ago";
+    if(s < 604800)return Math.floor(s/86400) + "d ago";
+    return new Date(t).toISOString().slice(0,10);
+  }
+
   /* ---- video preview ----
      The mp4 lives on the VPS behind a Bearer-authed endpoint, and a <video src>
      can't send headers — so fetch the bytes and play them from an object URL.
@@ -554,7 +576,7 @@
           '<span class="pv"><span><svg width="11" height="12" viewBox="0 0 11 12" fill="#fff" aria-hidden="true"><path d="M0 0l11 6-11 6z"/></svg></span></span>'+
           (c.duration?'<span class="d">'+fmtDur(c.duration)+'</span>':'')+'</button>'+
         '<div class="body"><div class="title">'+esc(c.title||"Untitled clip")+'</div>'+
-        '<div class="meta"><span>'+esc(host(c.source_url))+'</span><span>'+esc(c.created_at||"")+'</span></div>'+platsHtml+'</div>'+actions;
+        '<div class="meta"><span>'+esc(host(c.source_url))+'</span><span title="'+esc(c.created_at||"")+'">'+esc(ago(c.created_at))+'</span></div>'+platsHtml+'</div>'+actions;
       // Playback is available on every tab — reviewing what already posted matters too.
       var thumbBtn = card.querySelector(".thumb.playable");
       if(thumbBtn) thumbBtn.addEventListener("click", function(){ openPreview(c); });
@@ -573,7 +595,42 @@
       }
       el.appendChild(card);
     });
+    selIdx = -1;
+    if(curTab === "pending" && list.length) selectCard(0);
   }
+
+  /* ---- keyboard review ----
+     Approving is repetitive, high-volume work; doing it mouse-first is the main
+     friction in the operator's day. J/K move, A/R decide, Space previews. */
+  var selIdx = -1;
+  function cards(){ return Array.prototype.slice.call(document.querySelectorAll("#clipList .clip")); }
+  function selectCard(i){
+    var cs = cards(); if(!cs.length) return;
+    selIdx = Math.max(0, Math.min(i, cs.length - 1));
+    cs.forEach(function(el, n){ el.classList.toggle("sel", n === selIdx); });
+    cs[selIdx].scrollIntoView({ block: "nearest" });
+  }
+  document.addEventListener("keydown", function(e){
+    // Never hijack typing, and let the modal own its own keys.
+    var t = e.target || {};
+    if(/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || "")) return;
+    if(!$("vpModal").hidden) return;
+    if($("sec-review").className.indexOf("on") === -1) return;
+
+    var k = e.key.toLowerCase();
+    if(k === "j" || e.key === "ArrowDown"){ e.preventDefault(); selectCard(selIdx + 1); return; }
+    if(k === "k" || e.key === "ArrowUp"){   e.preventDefault(); selectCard(selIdx - 1); return; }
+
+    var cs = cards(); var card = cs[selIdx]; if(!card) return;
+    if(k === " " || e.key === "Enter"){
+      e.preventDefault();
+      var thumb = card.querySelector(".thumb.playable"); if(thumb) thumb.click();
+    } else if(k === "a"){
+      var ap = card.querySelector(".btn-approve"); if(ap && !ap.disabled){ e.preventDefault(); ap.click(); }
+    } else if(k === "r"){
+      var rj = card.querySelector(".btn-reject"); if(rj && !rj.disabled){ e.preventDefault(); rj.click(); }
+    }
+  });
   function short(s){ s=s||"clip"; return s.length>26?s.slice(0,24)+"…":s; }
   function esc(s){ var d=document.createElement("div"); d.textContent=s==null?"":s; return d.innerHTML; }
 
