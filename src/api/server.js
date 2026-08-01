@@ -1015,6 +1015,33 @@ app.post('/api/bridge/posts/:clipId/result', async (req, res) => {
     }
 });
 
+// ---- local footage upload (desktop → VPS) ----
+// The operator picks a video on their laptop; /api/clips/generate takes a
+// sourcePath that must exist ON THE VPS, so the bytes have to land here first.
+// Raw body (no multipart dep): express.json ignores video/* content types, so
+// express.raw handles it on this route only. Bearer-authed like all of /api/bridge.
+app.post('/api/bridge/upload',
+    express.raw({ type: ['video/*', 'application/octet-stream'], limit: process.env.UPLOAD_MAX_SIZE || '512mb' }),
+    async (req, res) => {
+        try {
+            if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+                return res.status(400).json({ error: 'Empty body — send the video bytes with Content-Type: video/mp4' });
+            }
+            // Never trust the client filename for a path; keep only a safe extension.
+            const raw = String(req.query.filename || '');
+            const ext = (raw.match(/\.(mp4|mov|m4v|webm|mkv)$/i) || ['.mp4'])[0].toLowerCase();
+            const dir = path.join(process.env.CLIP_DATA_DIR || '/app/data', 'sources');
+            await fs.promises.mkdir(dir, { recursive: true });
+            const sourcePath = path.join(dir, `upload_${crypto.randomUUID()}${ext}`);
+            await fs.promises.writeFile(sourcePath, req.body);
+
+            res.json({ status: 'uploaded', sourcePath, bytes: req.body.length });
+        } catch (error) {
+            console.error('Bridge upload error:', error);
+            res.status(500).json({ error: 'Failed to store upload' });
+        }
+    });
+
 // ---- engagement scans (desktop reads the comments, VPS does the thinking) ----
 
 // Claim the next comment-scan job.
