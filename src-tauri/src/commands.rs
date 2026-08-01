@@ -66,12 +66,17 @@ pub async fn approve_clip(
     db: State<'_, db::Database>,
     clip_id: String,
     platforms: Vec<String>,
+    // Optional edited post text. Lets the operator fix a weak hook at approval
+    // time instead of rejecting an otherwise-good render (and burning the credits
+    // that produced it). None → the VPS falls back to the clip title.
+    caption: Option<String>,
 ) -> Result<(), String> {
     // Push to the VPS (source of truth for posting) when configured. Best-effort:
     // the local decision is authoritative for the UI; a re-sync reconciles later.
     let (vps_url, api_key) = read_conn(&app);
     if !vps_url.is_empty() {
-        if let Err(e) = api::approve_clip_remote(&vps_url, &api_key, &clip_id, &platforms).await {
+        if let Err(e) = api::approve_clip_remote(&vps_url, &api_key, &clip_id, &platforms,
+                                                 caption.as_deref()).await {
             log::warn!("VPS approve push failed for {clip_id}: {e}");
         }
     }

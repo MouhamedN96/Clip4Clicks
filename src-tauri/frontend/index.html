@@ -82,6 +82,15 @@
   /* keyboard-driven review: the operator works through 30-90 of these a day, so
      the queue is navigable without the mouse (J/K, A approve, R reject, Space preview). */
   .clip.sel{border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset}
+  /* Editable post text: most "almost clean" output only needs a better hook, and
+     rejecting would throw away a good render (and the credits that made it). */
+  .capw{margin-top:.55rem}
+  .capw textarea{width:100%; font-family:inherit; font-size:.85rem; line-height:1.4; resize:vertical;
+    min-height:44px; background:var(--ink); color:var(--text); border:1px solid var(--line);
+    border-radius:6px; padding:.45rem .55rem}
+  .capw textarea:focus{border-color:var(--accent); outline:none}
+  .capw .cl{display:flex; justify-content:space-between; align-items:center; margin-top:.2rem}
+  .capw .cl span{font-family:var(--font-mono); font-size:.62rem; color:var(--faint)}
   .kbhint{font-family:var(--font-mono); font-size:.68rem; color:var(--faint); margin-bottom:.7rem; letter-spacing:.02em}
   .kbhint b{color:var(--muted); font-weight:600; background:var(--panel-2); border:1px solid var(--line);
     border-radius:3px; padding:.05rem .3rem; margin:0 .1rem}
@@ -567,7 +576,9 @@
       var card=document.createElement("div"); card.className="clip";
       var sel=new Set((c.platforms&&c.platforms.length)?c.platforms:["tiktok"]);
       var platsHtml = curTab==="pending" ? '<div class="plats">'+PLATFORMS.map(function(p){
-        return '<button class="pchip'+(sel.has(p)?" on":"")+'" data-p="'+p+'" type="button">'+p+'</button>'; }).join("")+'</div>' : "";
+        return '<button class="pchip'+(sel.has(p)?" on":"")+'" data-p="'+p+'" type="button">'+p+'</button>'; }).join("")+'</div>'+
+        '<div class="capw"><textarea rows="2" aria-label="Post caption" placeholder="Post caption…">'+esc(c.title||"")+'</textarea>'+
+        '<div class="cl"><span>edit before approving</span><span class="cc"></span></div></div>' : "";
       var actions = curTab==="pending"
         ? '<div class="actions"><button class="btn btn-approve" type="button">Approve</button><button class="btn btn-reject" type="button">Reject</button></div>'
         : '<div class="actions"><span class="status-chip st-'+curTab+'">'+curTab+'</span></div>';
@@ -583,10 +594,17 @@
       if(curTab==="pending"){
         card.querySelectorAll(".pchip").forEach(function(ch){ ch.addEventListener("click",function(){
           if(sel.has(ch.dataset.p)) sel.delete(ch.dataset.p); else sel.add(ch.dataset.p); ch.classList.toggle("on"); }); });
+        // Live character count — platforms clip long captions, so surface the length.
+        var capEl = card.querySelector(".capw textarea"), ccEl = card.querySelector(".capw .cc");
+        if(capEl && ccEl){
+          var upd=function(){ ccEl.textContent = capEl.value.length + " chars"; };
+          upd(); capEl.addEventListener("input", upd);
+        }
         card.querySelector(".btn-approve").addEventListener("click",function(ev){
           var plats=Array.from(sel); if(!plats.length){ toast("Pick at least one platform",1); return; }
           ev.target.disabled=true;
-          call("approve_clip",{clipId:c.id, platforms:plats}).then(function(){ toast("Approved <b>"+esc(short(c.title))+"</b> → "+plats.join(", ")); loadReview(); loadBadges(); })
+          var caption = capEl ? capEl.value.trim() : "";
+          call("approve_clip",{clipId:c.id, platforms:plats, caption: caption || null}).then(function(){ toast("Approved <b>"+esc(short(c.title))+"</b> → "+plats.join(", ")); loadReview(); loadBadges(); })
             .catch(function(e){ ev.target.disabled=false; toast("Approve failed: "+e,1); }); });
         card.querySelector(".btn-reject").addEventListener("click",function(ev){
           ev.target.disabled=true;

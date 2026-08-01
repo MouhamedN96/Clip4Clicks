@@ -124,10 +124,17 @@ pub async fn approve_clip_remote(
     api_key: &str,
     clip_id: &str,
     platforms: &[String],
+    caption: Option<&str>,
 ) -> Result<(), String> {
     let c = client(15)?;
     let url = format!("{}/api/clips/{}/approve", base(vps_url), clip_id);
-    let mut req = c.post(&url).json(&serde_json::json!({ "platforms": platforms }));
+    // The VPS applies `caption` to the post when present; omit it entirely so the
+    // server keeps falling back to the clip title rather than posting an empty one.
+    let mut body = serde_json::json!({ "platforms": platforms });
+    if let Some(text) = caption.map(str::trim).filter(|s| !s.is_empty()) {
+        body["caption"] = serde_json::Value::String(text.to_string());
+    }
+    let mut req = c.post(&url).json(&body);
     if !api_key.is_empty() {
         req = req.bearer_auth(api_key);
     }
