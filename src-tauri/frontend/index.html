@@ -596,6 +596,9 @@
       // Playback is available on every tab — reviewing what already posted matters too.
       var thumbBtn = card.querySelector(".thumb.playable");
       if(thumbBtn) thumbBtn.addEventListener("click", function(){ openPreview(c); });
+      // Mouse and keyboard stay in sync: clicking anywhere on a card selects it,
+      // so J/K resumes from where you clicked instead of somewhere else.
+      (function(idx){ card.addEventListener("click", function(){ selectCard(idx); }); })(list.indexOf(c));
       if(curTab==="pending"){
         card.querySelectorAll(".pchip").forEach(function(ch){ ch.addEventListener("click",function(){
           if(sel.has(ch.dataset.p)) sel.delete(ch.dataset.p); else sel.add(ch.dataset.p); ch.classList.toggle("on"); }); });
@@ -803,7 +806,9 @@
     var payload={vps_url:$("setUrl").value.trim(), api_key:$("setKey").value, brand_name:$("setBrand").value.trim()||"Clip4Clicks",
       render_local:$("setRender").checked, auto_sync:$("setAuto").checked};
     call("save_settings",{settings:payload}).then(function(){ settings=payload; $("brandSub").textContent=payload.brand_name.toUpperCase();
-      $("banner").classList.toggle("show", !payload.api_key); toast("Settings saved"); checkHealth(); })
+      $("banner").classList.toggle("show", !payload.api_key); toast("Settings saved"); checkHealth();
+      // Toggling auto-sync should take effect immediately, not next launch.
+      startAutoSync(); if(payload.auto_sync) initNotifications(); })
       .catch(function(e){ toast("Save failed: "+e,1); });
   });
   $("checkBtn").addEventListener("click",checkHealth);
@@ -827,6 +832,59 @@
   });
 
   function loadBadges(){ call("get_review_queue").then(function(q){ $("bReview").textContent=(q.pending||[]).length; }).catch(function(){}); }
+
+  /* ---- auto-sync + notifications ----
+     An operator console that doesn't tell you there's work gets checked out of
+     habit, or not at all. This pulls the queue on a timer and raises a native
+     notification when the pending count grows. */
+  var AUTO_SYNC_MS = 60000, autoTimer = null, lastPending = null, notifyOk = false;
+
+  function initNotifications(){
+    var n = T && T.notification; if(!n) return;
+    Promise.resolve(n.isPermissionGranted()).then(function(granted){
+      if(granted) { notifyOk = true; return; }
+      return Promise.resolve(n.requestPermission()).then(function(p){ notifyOk = (p === "granted"); });
+    }).catch(function(){ notifyOk = false; });
+  }
+
+  function notifyNewClips(n){
+    if(!notifyOk) return;
+    try {
+      T.notification.sendNotification({
+        title: (settings.brand_name || "Clip4Clicks") + " — review queue",
+        body: n + " new clip" + (n === 1 ? "" : "s") + " awaiting your approval."
+      });
+    } catch(e){}
+  }
+
+  // True while the operator is mid-edit, so a background refresh can't wipe a
+  // caption they're typing.
+  function isEditingReview(){
+    var a = document.activeElement;
+    return !!(a && /^(TEXTAREA|INPUT)$/.test(a.tagName) && a.closest && a.closest("#clipList"));
+  }
+
+  function autoSyncTick(){
+    if(!settings.auto_sync) return;
+    var url = settings.vps_url || ""; if(!url) return;
+    call("sync_with_vps", { vpsUrl: url, apiKey: settings.api_key || "" })
+      .then(function(){ return call("get_review_queue"); })
+      .then(function(q){
+        var n = (q.pending || []).length;
+        $("bReview").textContent = n;
+        if(lastPending !== null && n > lastPending) notifyNewClips(n - lastPending);
+        var grew = (lastPending !== null && n !== lastPending);
+        lastPending = n;
+        // Only redraw the visible queue when it actually changed and nobody's typing.
+        if(grew && $("sec-review").className.indexOf("on") !== -1 && !isEditingReview()) loadReview();
+      })
+      .catch(function(){ /* offline is normal; the VPS dot already reports it */ });
+  }
+
+  function startAutoSync(){
+    if(autoTimer) clearInterval(autoTimer);
+    autoTimer = setInterval(autoSyncTick, AUTO_SYNC_MS);
+  }
 
   // ---- bridge ----
   var LOG_CAP=200, brTicking=false;
@@ -925,6 +983,7 @@
   if(!LIVE) seedBridgeDemo();
   renderUploadPlatforms(); clearLocalFile();
   loadSettings(); loadReview(); renderProduce(); loadBridge(); loadBridgeDevices();
+  initNotifications(); startAutoSync();
 })();
 </script>
 
