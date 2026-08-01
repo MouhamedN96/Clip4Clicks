@@ -77,6 +77,32 @@
   .clip{display:grid; grid-template-columns:96px 1fr auto; gap:1rem; background:var(--panel); border:1px solid var(--line);
     border-radius:8px; padding:.8rem; align-items:center}
   .thumb{width:96px; aspect-ratio:9/16; border-radius:5px; overflow:hidden; position:relative; border:1px solid var(--line)}
+  /* Clickable thumb → opens the preview. Approving a clip you can't watch makes
+     the human gate a rubber stamp, so playback is part of the review flow. */
+  .thumb.playable{cursor:pointer; border:0; padding:0; transition:transform .18s ease, box-shadow .18s ease}
+  .thumb.playable:hover{transform:translateY(-2px); box-shadow:0 8px 20px -10px rgba(0,0,0,.7)}
+  .thumb.playable:focus-visible{outline:2px solid var(--accent); outline-offset:2px}
+  .thumb .pv{position:absolute; inset:0; display:grid; place-items:center; opacity:.85; transition:opacity .18s}
+  .thumb.playable:hover .pv{opacity:1}
+  .thumb .pv span{width:30px; height:30px; border-radius:50%; background:rgba(0,0,0,.5);
+    border:1px solid rgba(255,255,255,.65); display:grid; place-items:center; backdrop-filter:blur(2px)}
+  /* video preview modal */
+  .vp{position:fixed; inset:0; z-index:60; display:grid; place-items:center}
+  .vp[hidden]{display:none}
+  .vp-back{position:absolute; inset:0; background:rgba(0,0,0,.72); backdrop-filter:blur(3px)}
+  .vp-panel{position:relative; background:var(--panel); border:1px solid var(--line); border-radius:10px;
+    width:min(94vw,420px); max-height:92vh; display:flex; flex-direction:column; overflow:hidden;
+    box-shadow:0 24px 70px -24px rgba(0,0,0,.8)}
+  .vp-head{display:flex; align-items:center; gap:.8rem; padding:.7rem .9rem; border-bottom:1px solid var(--line)}
+  .vp-title{flex:1; min-width:0; font-size:.92rem; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+  .vp-x{background:transparent; border:1px solid var(--line); color:var(--muted); border-radius:5px;
+    width:32px; height:32px; cursor:pointer; line-height:1}
+  .vp-x:hover{color:var(--text); border-color:var(--muted)}
+  .vp-body{padding:.9rem; display:grid; place-items:center; min-height:180px}
+  .vp-body video{width:100%; max-height:70vh; border-radius:6px; background:#000; display:block}
+  .vp-msg{font-size:.9rem; color:var(--muted); text-align:center; padding:2rem 1rem; line-height:1.5}
+  @media (pointer:coarse){ .vp-x{width:44px; height:44px} }
+  @media (prefers-reduced-motion:reduce){ .thumb.playable,.thumb .pv{transition:none} .thumb.playable:hover{transform:none} }
   .thumb .d{position:absolute; bottom:4px; right:4px; font-family:var(--font-mono); font-size:.6rem; background:rgba(0,0,0,.55);
     color:#fff; padding:.05rem .3rem; border-radius:2px}
   .clip .body{min-width:0}
@@ -304,6 +330,19 @@
     </div>
   </div>
 </div>
+<div class="vp" id="vpModal" hidden>
+  <div class="vp-back" id="vpBack"></div>
+  <div class="vp-panel" role="dialog" aria-modal="true" aria-label="Clip preview">
+    <div class="vp-head">
+      <span class="vp-title" id="vpTitle">Clip preview</span>
+      <button class="vp-x" id="vpClose" type="button" aria-label="Close preview">✕</button>
+    </div>
+    <div class="vp-body">
+      <video id="vpVideo" controls preload="none" playsinline style="display:none"></video>
+      <div class="vp-msg" id="vpMsg"></div>
+    </div>
+  </div>
+</div>
 <div id="toast"></div>
 
 <script>
@@ -402,6 +441,62 @@
     renderClips();
   }).catch(function(e){ toast("Couldn't load queue: "+e,1); }); }
 
+  /* ---- video preview ----
+     The mp4 lives on the VPS behind a Bearer-authed endpoint, and a <video src>
+     can't send headers — so fetch the bytes and play them from an object URL.
+     The URL is always revoked on close/replace: these are multi-MB blobs and the
+     review list can be long. */
+  var vpUrl = null;
+  function vpMsg(text){ $("vpMsg").textContent = text; $("vpMsg").style.display = "block"; $("vpVideo").style.display = "none"; }
+  function vpVideoOn(){ $("vpMsg").style.display = "none"; $("vpVideo").style.display = "block"; }
+
+  function closePreview(){
+    var v = $("vpVideo");
+    try { v.pause(); } catch(e){}
+    v.removeAttribute("src");
+    try { v.load(); } catch(e){}
+    if(vpUrl){ URL.revokeObjectURL(vpUrl); vpUrl = null; }
+    $("vpModal").hidden = true;
+  }
+
+  function openPreview(c){
+    $("vpTitle").textContent = c.title || "Clip preview";
+    $("vpModal").hidden = false;
+    vpMsg("Loading video…");
+
+    if(!LIVE){ vpMsg("Preview unavailable in demo mode."); return; }
+    var base = String(settings.vps_url || "").replace(/\/+$/, "");
+    if(!base){ vpMsg("No VPS URL set — add it in Settings."); return; }
+    if(!settings.api_key){ vpMsg("No API key set — add it in Settings."); return; }
+
+    fetch(base + "/api/bridge/clips/" + encodeURIComponent(c.id) + "/file",
+          { headers: { Authorization: "Bearer " + settings.api_key } })
+      .then(function(res){
+        if(res.status === 404) throw new Error("No rendered file for this clip yet.");
+        if(res.status === 401) throw new Error("Not authorized — check the API key in Settings.");
+        if(!res.ok) throw new Error("Couldn't load video (HTTP " + res.status + ").");
+        return res.blob();
+      })
+      .then(function(blob){
+        if($("vpModal").hidden) return;           // operator closed it mid-download
+        if(vpUrl) URL.revokeObjectURL(vpUrl);
+        vpUrl = URL.createObjectURL(blob);
+        var v = $("vpVideo");
+        v.src = vpUrl;
+        vpVideoOn();
+        v.play().catch(function(){});             // autoplay may be blocked; controls still work
+      })
+      .catch(function(e){
+        vpMsg(/HTTP|authorized|rendered/.test(e.message) ? e.message : "Couldn't reach the VPS.");
+      });
+  }
+
+  $("vpClose").addEventListener("click", closePreview);
+  $("vpBack").addEventListener("click", closePreview);
+  document.addEventListener("keydown", function(e){
+    if(e.key === "Escape" && !$("vpModal").hidden) closePreview();
+  });
+
   function renderClips(){
     var list=queueData[curTab]||[], el=$("clipList");
     if(!list.length){ el.innerHTML='<div class="empty"><span class="lbl">'+curTab+'</span>Nothing here yet.'+(curTab==="pending"?" Sync with the VPS or queue a source to produce.":"")+'</div>'; return; }
@@ -415,9 +510,14 @@
         ? '<div class="actions"><button class="btn btn-approve" type="button">Approve</button><button class="btn btn-reject" type="button">Reject</button></div>'
         : '<div class="actions"><span class="status-chip st-'+curTab+'">'+curTab+'</span></div>';
       card.innerHTML =
-        '<div class="thumb" style="background:'+grad(c.id)+'">'+(c.duration?'<span class="d">'+fmtDur(c.duration)+'</span>':'')+'</div>'+
+        '<button class="thumb playable" type="button" aria-label="Play preview" style="background:'+grad(c.id)+'">'+
+          '<span class="pv"><span><svg width="11" height="12" viewBox="0 0 11 12" fill="#fff" aria-hidden="true"><path d="M0 0l11 6-11 6z"/></svg></span></span>'+
+          (c.duration?'<span class="d">'+fmtDur(c.duration)+'</span>':'')+'</button>'+
         '<div class="body"><div class="title">'+esc(c.title||"Untitled clip")+'</div>'+
         '<div class="meta"><span>'+esc(host(c.source_url))+'</span><span>'+esc(c.created_at||"")+'</span></div>'+platsHtml+'</div>'+actions;
+      // Playback is available on every tab — reviewing what already posted matters too.
+      var thumbBtn = card.querySelector(".thumb.playable");
+      if(thumbBtn) thumbBtn.addEventListener("click", function(){ openPreview(c); });
       if(curTab==="pending"){
         card.querySelectorAll(".pchip").forEach(function(ch){ ch.addEventListener("click",function(){
           if(sel.has(ch.dataset.p)) sel.delete(ch.dataset.p); else sel.add(ch.dataset.p); ch.classList.toggle("on"); }); });
