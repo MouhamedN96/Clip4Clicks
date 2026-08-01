@@ -3,6 +3,7 @@
  * Background job processor for clip generation and outreach
  */
 
+const { spawn } = require('child_process');
 const { Pool } = require('pg');
 const Redis = require('ioredis');
 const WhopIntegration = require('../integration/whop');
@@ -298,8 +299,29 @@ async function processProductAdJob(job) {
     }
 }
 
+// Grab a still from a produced clip so the review queue is scannable at a glance
+// (a wall of identical placeholders tells the operator nothing). Best-effort:
+// any failure just means no poster, never a failed clip.
+function extractPoster(clipPath) {
+    return new Promise((resolve) => {
+        const out = String(clipPath).replace(/\.[^.]+$/, '') + '_poster.jpg';
+        // -ss before -i seeks fast; 1s in avoids a black first frame.
+        const proc = spawn('ffmpeg', ['-y', '-ss', '1', '-i', clipPath,
+            '-frames:v', '1', '-vf', 'scale=216:-1', '-q:v', '5', out], { shell: false });
+        const timer = setTimeout(() => { try { proc.kill(); } catch (e) {} resolve(null); }, 20000);
+        proc.on('close', (code) => { clearTimeout(timer); resolve(code === 0 ? out : null); });
+        proc.on('error', () => { clearTimeout(timer); resolve(null); });
+    });
+}
+
 // Update a clip's status + merge metadata.
+// When a clip first lands in the review gate we also extract a poster frame, so
+// every production path (clip/reel/spec-ad/product-ad) gets one for free.
 async function setClipStatus(clipId, status, metaPatch = {}) {
+    if (status === 'pending_review' && metaPatch.clipPath && !metaPatch.poster) {
+        const poster = await extractPoster(metaPatch.clipPath);
+        if (poster) metaPatch = { ...metaPatch, poster };
+    }
     const client = await pool.connect();
     try {
         await client.query(

@@ -982,6 +982,34 @@ app.get('/api/bridge/clips/:id/file', async (req, res) => {
     }
 });
 
+// Serve the poster still for a clip, so the review queue shows what each clip
+// actually is instead of a placeholder. Same CLIP_DATA_DIR confinement as the
+// video route. 404 (not an error) when a clip has no poster.
+app.get('/api/bridge/clips/:id/poster', async (req, res) => {
+    try {
+        const c = await pool.connect();
+        let posterPath;
+        try {
+            const r = await c.query('SELECT metadata FROM clips WHERE id = $1', [req.params.id]);
+            if (!r.rows.length) return res.status(404).json({ error: 'Clip not found' });
+            posterPath = (r.rows[0].metadata || {}).poster;
+        } finally { c.release(); }
+        if (!posterPath) return res.status(404).json({ error: 'No poster for this clip' });
+
+        const dataDir = path.resolve(process.env.CLIP_DATA_DIR || '/app/data') + path.sep;
+        let real;
+        try { real = fs.realpathSync(path.resolve(posterPath)); }
+        catch { return res.status(404).json({ error: 'Poster not available' }); }
+        if (!(real + path.sep).startsWith(dataDir)) {
+            return res.status(404).json({ error: 'Poster not available' });
+        }
+        res.sendFile(real);
+    } catch (error) {
+        console.error('Bridge poster error:', error);
+        res.status(500).json({ error: 'Failed to serve poster' });
+    }
+});
+
 // Desktop reports the outcome of a post job (mirrors the worker's status update).
 app.post('/api/bridge/posts/:clipId/result', async (req, res) => {
     try {
