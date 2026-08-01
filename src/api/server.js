@@ -363,6 +363,57 @@ app.post('/api/clips/:id/approve', async (req, res) => {
     }
 });
 
+// Re-roll: produce this clip again from its original job.
+// The middle path between approve and reject — when the output is close but the
+// take is wrong, rejecting would bin a usable concept (and the credits spent).
+// Generators are non-deterministic, so re-running the same job yields a new take;
+// an optional `angle`/`brief` override steers it. The old clip is retired so the
+// review queue doesn't accumulate duplicates of the same idea.
+app.post('/api/clips/:id/regenerate', async (req, res) => {
+    try {
+        const { angle, brief } = req.body || {};
+        const client = await pool.connect();
+        try {
+            const r = await client.query('SELECT * FROM clips WHERE id = $1', [req.params.id]);
+            if (!r.rows.length) return res.status(404).json({ error: 'Clip not found' });
+            const clip = r.rows[0];
+            const meta = clip.metadata || {};
+            const job = meta.job;
+            if (!job) {
+                return res.status(422).json({ error: 'This clip predates job capture and cannot be re-rolled' });
+            }
+
+            // Route back to the queue that produced it.
+            const queueFor = {
+                stock: 'reel_queue',
+                higgsfield: 'generate_queue',
+                seedance: 'product_ad_queue'
+            };
+            const queue = queueFor[clip.source_platform] || 'clip_queue';
+
+            const next = { ...job, queuedAt: new Date().toISOString(), rerollOf: clip.id };
+            if (angle) next.angle = angle;   // product ads take an angle
+            if (brief) next.brief = brief;   // reels / spec-ads take a brief
+            await redis.lpush(queue, JSON.stringify(next));
+
+            // Retire the old take so it stops occupying the gate.
+            await client.query(
+                `UPDATE clips SET status = 'rejected',
+                 metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb
+                 WHERE id = $2`,
+                [JSON.stringify({ rejectedAt: new Date().toISOString(), rejectReason: 'superseded by re-roll' }), clip.id]
+            );
+
+            res.json({ status: 'requeued', queue, supersededClipId: clip.id });
+        } finally {
+            client.release();
+        }
+    } catch (error) {
+        console.error('Regenerate error:', error);
+        res.status(500).json({ error: 'Failed to re-roll clip' });
+    }
+});
+
 // Reject a clip → nothing posts; record the reason.
 app.post('/api/clips/:id/reject', async (req, res) => {
     try {

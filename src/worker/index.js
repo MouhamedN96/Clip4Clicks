@@ -113,6 +113,7 @@ async function processClipJob(job) {
         const primary = produced[0];
         await setClipStatus(clipId, 'pending_review', {
             producedAt: new Date().toISOString(),
+            job: reQueueable(job),
             segments: produced.map(p => ({ start: p.start, end: p.end, path: p.path, title: p.title })),
             clipPath: primary.path,
             captions: primary.captions,
@@ -172,6 +173,7 @@ async function processGenerateJob(job) {
 
         await setClipStatus(clipId, 'pending_review', {
             producedAt: new Date().toISOString(),
+            job: reQueueable(job),
             clipPath: seg.path,
             provider: seg.provider || 'higgsfield',
             model: seg.model,
@@ -216,6 +218,7 @@ async function processReelJob(job) {
 
         await setClipStatus(clipId, 'pending_review', {
             producedAt: new Date().toISOString(),
+            job: reQueueable(job),
             clipPath: seg.path,
             provider: seg.provider || 'stock',
             model: seg.model,
@@ -272,6 +275,7 @@ async function processProductAdJob(job) {
 
         await setClipStatus(clipId, 'pending_review', {
             producedAt: new Date().toISOString(),
+            job: reQueueable(job),
             type: 'product_ad',
             clipPath: seg.path,
             provider: seg.provider || 'seedance',
@@ -323,6 +327,14 @@ async function extractPoster(clipPath) {
     if (await grabFrame(clipPath, out, 0)) return out;
     console.warn(`poster extraction failed for ${clipPath}`);
     return null;
+}
+
+// Strip the transient bits and keep what's needed to re-queue this exact job.
+// Without this a re-roll can't reproduce a reel/spec-ad, since the brief that
+// created them lived only in the queue message.
+function reQueueable(job = {}) {
+    const { queuedAt, clipId, ...rest } = job;
+    return rest;
 }
 
 // Update a clip's status + merge metadata.
