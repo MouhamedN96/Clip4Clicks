@@ -13,6 +13,7 @@ const crypto = require('crypto');
 const { Pool } = require('pg');
 const Redis = require('ioredis');
 const WhopIntegration = require('../integration/whop');
+const { extractPoster } = require('../production/poster');
 const mobileuse = require('../integration/mobileuse');
 const engagementProducer = require('../production/engagement');
 
@@ -1039,11 +1040,27 @@ app.get('/api/bridge/clips/:id/file', async (req, res) => {
 app.get('/api/bridge/clips/:id/poster', async (req, res) => {
     try {
         const c = await pool.connect();
-        let posterPath;
+        let posterPath, clipPath;
         try {
             const r = await c.query('SELECT metadata FROM clips WHERE id = $1', [req.params.id]);
             if (!r.rows.length) return res.status(404).json({ error: 'Clip not found' });
-            posterPath = (r.rows[0].metadata || {}).poster;
+            const meta = r.rows[0].metadata || {};
+            posterPath = meta.poster;
+            clipPath = meta.clipPath;
+
+            // Backfill on demand: clips produced before posters existed have a
+            // video but no still. Generate it the first time one is asked for and
+            // persist it, so old clips heal themselves without a migration.
+            if (!posterPath && clipPath) {
+                const made = await extractPoster(clipPath);
+                if (made) {
+                    posterPath = made;
+                    await c.query(
+                        `UPDATE clips SET metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb WHERE id = $2`,
+                        [JSON.stringify({ poster: made }), req.params.id]
+                    );
+                }
+            }
         } finally { c.release(); }
         if (!posterPath) return res.status(404).json({ error: 'No poster for this clip' });
 
