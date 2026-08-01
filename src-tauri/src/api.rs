@@ -268,6 +268,40 @@ pub async fn generate_from_source(
     ))
 }
 
+/// Re-roll: ask the VPS to produce this clip again from its original job.
+/// Unlike approve/reject this is NOT best-effort — if it fails, nothing was
+/// requeued, so the caller must surface the error rather than assume success.
+pub async fn regenerate_clip_remote(
+    vps_url: &str,
+    api_key: &str,
+    clip_id: &str,
+    angle: Option<&str>,
+) -> Result<(), String> {
+    let c = client(30)?;
+    let url = format!("{}/api/clips/{}/regenerate", base(vps_url), clip_id);
+    let mut body = serde_json::json!({});
+    if let Some(text) = angle.map(str::trim).filter(|s| !s.is_empty()) {
+        // The server routes this to `angle` (product ads) or `brief` (reels/spec-ads).
+        body["angle"] = serde_json::Value::String(text.to_string());
+        body["brief"] = serde_json::Value::String(text.to_string());
+    }
+    let mut req = c.post(&url).json(&body);
+    if !api_key.is_empty() {
+        req = req.bearer_auth(api_key);
+    }
+    let resp = req.send().await.map_err(|e| format!("re-roll failed: {e}"))?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let text = resp.text().await.unwrap_or_default();
+    Err(format!(
+        "re-roll failed: http {} {}",
+        status.as_u16(),
+        text.chars().take(200).collect::<String>()
+    ))
+}
+
 // ── Products (VPS scaffold; not used by the operator UI yet) ───
 
 pub async fn get_products(vps_url: &str) -> Result<serde_json::Value, String> {

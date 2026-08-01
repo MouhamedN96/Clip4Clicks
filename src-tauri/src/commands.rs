@@ -100,6 +100,27 @@ pub async fn reject_clip(
     db.reject_clip(&clip_id, &reason).map_err(|e| e.to_string())
 }
 
+/// Re-roll a clip: the middle path between approve and reject. The VPS re-queues
+/// the original job (generators are non-deterministic, so you get a new take) and
+/// retires this one. Errors propagate — unlike approve/reject there's no local
+/// fallback, so a silent failure would look like a no-op.
+#[tauri::command]
+pub async fn regenerate_clip(
+    app: AppHandle,
+    db: State<'_, db::Database>,
+    clip_id: String,
+    angle: Option<String>,
+) -> Result<(), String> {
+    let (vps_url, api_key) = read_conn(&app);
+    if vps_url.trim().is_empty() {
+        return Err("No VPS URL configured — set it in Settings.".to_string());
+    }
+    api::regenerate_clip_remote(&vps_url, &api_key, &clip_id, angle.as_deref()).await?;
+    // Mirror the VPS: this take is superseded, so drop it from the local queue too.
+    let _ = db.reject_clip(&clip_id, "superseded by re-roll");
+    Ok(())
+}
+
 // ── Production ────────────────────────────────────────────────
 
 #[tauri::command]

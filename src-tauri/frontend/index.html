@@ -91,6 +91,9 @@
   .capw textarea:focus{border-color:var(--accent); outline:none}
   .capw .cl{display:flex; justify-content:space-between; align-items:center; margin-top:.2rem}
   .capw .cl span{font-family:var(--font-mono); font-size:.62rem; color:var(--faint)}
+  /* Re-roll sits between approve and reject, visually and semantically. */
+  .btn-reroll{background:transparent; color:var(--gold,#E3B24C); border:1px solid var(--line)}
+  .btn-reroll:hover:not(:disabled){border-color:var(--gold,#E3B24C)}
   .kbhint{font-family:var(--font-mono); font-size:.68rem; color:var(--faint); margin-bottom:.7rem; letter-spacing:.02em}
   .kbhint b{color:var(--muted); font-weight:600; background:var(--panel-2); border:1px solid var(--line);
     border-radius:3px; padding:.05rem .3rem; margin:0 .1rem}
@@ -275,7 +278,7 @@
           <button class="tab" data-tab="approved" type="button">Approved <span class="n" id="tApproved">0</span></button>
           <button class="tab" data-tab="posted" type="button">Posted <span class="n" id="tPosted">0</span></button>
         </div>
-        <div class="kbhint"><b>J</b><b>K</b> move · <b>Space</b> preview · <b>A</b> approve · <b>R</b> reject</div>
+        <div class="kbhint"><b>J</b><b>K</b> move · <b>Space</b> preview · <b>A</b> approve · <b>G</b> re-roll · <b>R</b> reject</div>
         <div class="clips" id="clipList"></div>
       </section>
 
@@ -580,7 +583,9 @@
         '<div class="capw"><textarea rows="2" aria-label="Post caption" placeholder="Post caption…">'+esc(c.title||"")+'</textarea>'+
         '<div class="cl"><span>edit before approving</span><span class="cc"></span></div></div>' : "";
       var actions = curTab==="pending"
-        ? '<div class="actions"><button class="btn btn-approve" type="button">Approve</button><button class="btn btn-reject" type="button">Reject</button></div>'
+        ? '<div class="actions"><button class="btn btn-approve" type="button">Approve</button>'+
+          '<button class="btn btn-reroll" type="button" title="Produce another take from the same job">Re-roll</button>'+
+          '<button class="btn btn-reject" type="button">Reject</button></div>'
         : '<div class="actions"><span class="status-chip st-'+curTab+'">'+curTab+'</span></div>';
       card.innerHTML =
         '<button class="thumb playable" type="button" aria-label="Play preview" style="background:'+grad(c.id)+'">'+
@@ -606,6 +611,15 @@
           var caption = capEl ? capEl.value.trim() : "";
           call("approve_clip",{clipId:c.id, platforms:plats, caption: caption || null}).then(function(){ toast("Approved <b>"+esc(short(c.title))+"</b> → "+plats.join(", ")); loadReview(); loadBadges(); })
             .catch(function(e){ ev.target.disabled=false; toast("Approve failed: "+e,1); }); });
+        // Re-roll: the caption box doubles as the steer ("make it punchier",
+        // "show the product in use") when its text differs from the original.
+        card.querySelector(".btn-reroll").addEventListener("click",function(ev){
+          ev.target.disabled=true;
+          var steer = (capEl && capEl.value.trim() !== (c.title||"").trim()) ? capEl.value.trim() : null;
+          call("regenerate_clip",{clipId:c.id, angle: steer}).then(function(){
+            toast("Re-rolling <b>"+esc(short(c.title))+"</b>"+(steer?" with a new steer":"")+" — new take will appear here");
+            loadReview(); loadBadges();
+          }).catch(function(e){ ev.target.disabled=false; toast("Re-roll failed: "+e,1); }); });
         card.querySelector(".btn-reject").addEventListener("click",function(ev){
           ev.target.disabled=true;
           call("reject_clip",{clipId:c.id, reason:"rejected by operator"}).then(function(){ toast("Rejected <b>"+esc(short(c.title))+"</b>"); loadReview(); loadBadges(); })
@@ -647,6 +661,8 @@
       var ap = card.querySelector(".btn-approve"); if(ap && !ap.disabled){ e.preventDefault(); ap.click(); }
     } else if(k === "r"){
       var rj = card.querySelector(".btn-reject"); if(rj && !rj.disabled){ e.preventDefault(); rj.click(); }
+    } else if(k === "g"){   // (g)o again — R was already taken by reject
+      var rr = card.querySelector(".btn-reroll"); if(rr && !rr.disabled){ e.preventDefault(); rr.click(); }
     }
   });
   function short(s){ s=s||"clip"; return s.length>26?s.slice(0,24)+"…":s; }

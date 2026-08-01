@@ -54,6 +54,7 @@ pub fn run() {
             commands::get_review_queue,
             commands::approve_clip,
             commands::reject_clip,
+            commands::regenerate_clip,
             commands::queue_clip,
             commands::get_clip_status,
             commands::render_clip,
