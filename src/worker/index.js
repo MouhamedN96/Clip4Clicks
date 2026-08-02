@@ -12,6 +12,7 @@ const HiggsfieldProducer = require('../production/higgsfield');
 const StockReelProducer = require('../production/stockreel');
 const ProductAdProducer = require('../production/productad');
 const { extractPoster } = require('../production/poster');
+const r2 = require('../integration/r2');
 // posting/engagement export plain function collections (not classes).
 const posting = require('../production/posting');
 const engagement = require('../production/engagement');
@@ -324,6 +325,18 @@ async function setClipStatus(clipId, status, metaPatch = {}) {
     if (status === 'pending_review' && metaPatch.clipPath && !metaPatch.poster) {
         const poster = await extractPoster(metaPatch.clipPath);
         if (poster) metaPatch = { ...metaPatch, poster };
+
+        // Push the media to R2 when configured. Free egress there, and the box
+        // stops being the single copy. Best-effort: a failure just means the
+        // local file keeps serving.
+        if (r2.isConfigured()) {
+            const [clipKey, posterKey] = await Promise.all([
+                r2.uploadAsset(metaPatch.clipPath, `clips/${clipId}`),
+                metaPatch.poster ? r2.uploadAsset(metaPatch.poster, `clips/${clipId}`) : Promise.resolve(null)
+            ]);
+            if (clipKey) metaPatch = { ...metaPatch, r2Key: clipKey };
+            if (posterKey) metaPatch = { ...metaPatch, r2PosterKey: posterKey };
+        }
     }
     const client = await pool.connect();
     try {

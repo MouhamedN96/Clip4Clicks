@@ -14,6 +14,7 @@ const { Pool } = require('pg');
 const Redis = require('ioredis');
 const WhopIntegration = require('../integration/whop');
 const { extractPoster } = require('../production/poster');
+const r2 = require('../integration/r2');
 const mobileuse = require('../integration/mobileuse');
 const engagementProducer = require('../production/engagement');
 
@@ -1010,12 +1011,22 @@ app.get('/api/bridge/posts/claim', async (req, res) => {
 app.get('/api/bridge/clips/:id/file', async (req, res) => {
     try {
         const c = await pool.connect();
-        let clipPath;
+        let clipPath, r2Key;
         try {
             const r = await c.query('SELECT metadata FROM clips WHERE id = $1', [req.params.id]);
             if (!r.rows.length) return res.status(404).json({ error: 'Clip not found' });
-            clipPath = (r.rows[0].metadata || {}).clipPath;
+            const meta = r.rows[0].metadata || {};
+            clipPath = meta.clipPath;
+            r2Key = meta.r2Key;
         } finally { c.release(); }
+
+        // Prefer R2: the bytes go straight from Cloudflare to the desktop (free
+        // egress, none of it through this box). The client follows the redirect,
+        // so the bridge contract is unchanged.
+        if (r2Key && r2.isConfigured()) {
+            try { return res.redirect(302, r2.presignGet(r2Key)); }
+            catch (e) { console.warn(`R2 presign failed, serving local: ${e.message}`); }
+        }
         if (!clipPath) return res.status(404).json({ error: 'Clip has no rendered file' });
 
         // Confine to CLIP_DATA_DIR: append a separator so "/app/data" can't match
@@ -1047,6 +1058,11 @@ app.get('/api/bridge/clips/:id/poster', async (req, res) => {
             const meta = r.rows[0].metadata || {};
             posterPath = meta.poster;
             clipPath = meta.clipPath;
+
+            if (meta.r2PosterKey && r2.isConfigured()) {
+                try { return res.redirect(302, r2.presignGet(meta.r2PosterKey)); }
+                catch (e) { console.warn(`R2 poster presign failed, serving local: ${e.message}`); }
+            }
 
             // Backfill on demand: clips produced before posters existed have a
             // video but no still. Generate it the first time one is asked for and
