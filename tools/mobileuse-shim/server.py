@@ -21,6 +21,8 @@ already speak, on top of the SDK that actually exists.
   POST /devices/{id}/type           <- { text }
   POST /devices/{id}/swipe          <- { x1, y1, x2, y2, duration_ms? }
   POST /devices/{id}/open           <- { package }
+  POST /devices/{id}/push?filename= <- raw video bytes
+                                    -> { device_path, bytes, indexed }
   POST /devices/{id}/agent          <- { instruction, max_steps? }
                                     -> { result, steps, device }
 
@@ -46,15 +48,19 @@ import asyncio
 import base64
 import io
 import os
+import posixpath
+import re
+import tempfile
 import threading
 import time
 import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import uvicorn
 from adbutils import AdbClient
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -349,6 +355,69 @@ def swipe(device_id: str, body: SwipeBody):
         ],
     )
     return {"ok": True}
+
+
+DEVICE_MEDIA_DIR = "/sdcard/Movies"
+_SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
+
+
+@app.post("/devices/{device_id}/push")
+async def push_media(device_id: str, request: Request, filename: str):
+    """Put a video on the device and make the gallery aware of it.
+
+    The desktop bridge downloads a clip to a *desktop* path and then tells the
+    agent to find that path "in the device gallery" - which is a path the phone
+    has never heard of. Posting only worked when the right video happened to
+    already be the most recent item. This is the missing step.
+    """
+    dev = _device(device_id)
+
+    # The name reaches a shell command; keep it to characters that cannot mean
+    # anything there, and never let it climb out of the media directory.
+    safe = _SAFE_NAME.sub("_", posixpath.basename(filename)).lstrip(".") or "clip.mp4"
+    remote = f"{DEVICE_MEDIA_DIR}/{safe}"
+
+    tmp = Path(tempfile.gettempdir()) / f"shim-push-{os.getpid()}-{safe}"
+    written = 0
+    try:
+        with tmp.open("wb") as fh:
+            async for chunk in request.stream():
+                fh.write(chunk)
+                written += len(chunk)
+        if written == 0:
+            raise HTTPException(status_code=400, detail="empty body")
+
+        try:
+            dev.sync.push(str(tmp), remote)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"adb push failed: {exc}") from exc
+    finally:
+        tmp.unlink(missing_ok=True)
+
+    # A pushed file is invisible to the gallery until MediaStore indexes it.
+    # The broadcast is the old way and is restricted on newer Android, so try
+    # it then fall back to the MediaStore scan_file call.
+    indexed = False
+    for cmd in (
+        ["am", "broadcast", "-a", "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+         "-d", f"file://{remote}"],
+        ["content", "call", "--uri", "content://media/external/file",
+         "--method", "scan_file", "--arg", remote],
+    ):
+        try:
+            out = dev.shell(cmd) or ""
+        except Exception:  # noqa: BLE001
+            continue
+        if "Exception" not in out and "Error" not in out:
+            indexed = True
+            break
+
+    return {
+        "ok": True,
+        "device_path": remote,
+        "bytes": written,
+        "indexed": indexed,
+    }
 
 
 @app.post("/devices/{device_id}/open")
