@@ -32,6 +32,9 @@ const pool = new Pool({
 });
 
 let passed = 0, failed = 0;
+// Read off Postgres, not this process — the container clock and the DB clock
+// can disagree, and a clock that runs fast here would let stale rows through.
+let startedAt = new Date(0);
 const created = { clips: [], msgs: [] };
 const ok = (m) => { passed++; console.log(`  ✓ ${m}`); };
 const bad = (m) => { failed++; console.log(`  ✗ ${m}`); };
@@ -105,11 +108,18 @@ async function waitOutreach(id, wanted, timeoutMs = 30000) {
 
 // Poll until a worker-created clip row matching `whereSql` appears (rows are
 // created inside the worker, so we can't rely on a fixed sleep).
+//
+// The `created_at > startedAt` bound is not optional. Without it, whenever the
+// worker takes longer than one poll tick to insert its row, this latches onto
+// the newest LEFTOVER clip from an earlier run — and the smoke then approves,
+// downloads and marks that real clip as posted. Only ever match rows this run
+// made.
 async function waitForClipId(whereSql, timeoutMs = 15000) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
         const { rows } = await pool.query(
-            `SELECT id FROM clips WHERE ${whereSql} ORDER BY created_at DESC LIMIT 1`);
+            `SELECT id FROM clips WHERE (${whereSql}) AND created_at > $1
+             ORDER BY created_at DESC LIMIT 1`, [startedAt]);
         if (rows[0]) return rows[0].id;
         await sleep(400);
     }
@@ -118,6 +128,9 @@ async function waitForClipId(whereSql, timeoutMs = 15000) {
 
 async function main() {
     console.log(`\nClipForge smoke — API ${API}\n`);
+
+    // Watermark every row lookup below: nothing older than this belongs to us.
+    startedAt = (await pool.query('SELECT now() AS t')).rows[0].t;
 
     // 0. API health
     try {
