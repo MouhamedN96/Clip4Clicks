@@ -31,7 +31,7 @@
 // the Mobile-Use server is down.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
     Arc, Mutex,
@@ -972,6 +972,69 @@ async fn download_clip(cfg: &BridgeConfig, job: &PostJob) -> Result<PathBuf, Str
     Ok(path)
 }
 
+/// Put the downloaded clip on the handset; returns the path it lives at *there*.
+///
+/// Without this the agent is handed a desktop path and told to find it "in the
+/// device gallery" - a path the phone has never seen. It only ever worked when
+/// the right video happened to already be the most recent gallery item.
+///
+/// The shim does the adb push and the MediaStore index (a pushed file is
+/// invisible to gallery pickers until it is indexed).
+async fn push_media(cfg: &BridgeConfig, device_id: &str, local: &Path) -> Result<String, String> {
+    // Tens of megabytes over adb to a real handset is not instant.
+    let http = client(600)?;
+    let name = local
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("clip.mp4");
+    let url = format!(
+        "{}/devices/{}/push?filename={}",
+        cfg.mobileuse_url.trim_end_matches('/'),
+        url_encode(device_id),
+        url_encode(name)
+    );
+
+    let bytes =
+        std::fs::read(local).map_err(|e| format!("cannot read {}: {e}", local.display()))?;
+
+    let resp = http
+        .post(&url)
+        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+        .body(bytes)
+        .send()
+        .await
+        .map_err(|e| format!("push to device failed: {e}"))?;
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "push to device failed: http {} {}",
+            status.as_u16(),
+            truncate(&body, 200)
+        ));
+    }
+
+    parse_push_response(&body)
+}
+
+/// Pull the on-device path out of a push response.
+///
+/// Split out from the request so the failure modes are testable: a shim that
+/// answers 200 with no usable path must be an error here, not a later agent run
+/// against an empty path.
+fn parse_push_response(body: &str) -> Result<String, String> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("push returned invalid JSON: {e}"))?;
+    parsed
+        .get("device_path")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| "push response had no device_path".to_string())
+}
+
 async fn report_results(
     cfg: &BridgeConfig,
     clip_id: &str,
@@ -1198,10 +1261,11 @@ async fn tick_posts(
             return Err(e);
         }
     };
-    let local_path_str = local_path.to_string_lossy().to_string();
-
     let mut results: Vec<serde_json::Value> = Vec::new();
     let mut succeeded = 0usize;
+    // One push per device, not per platform: two platforms on the same handset
+    // share the file, and re-pushing 40MB for the second one is pure waste.
+    let mut pushed: HashMap<String, String> = HashMap::new();
 
     for platform in &job.platforms {
         let device_id = match pick_device(cfg, platform, devices) {
@@ -1216,8 +1280,31 @@ async fn tick_posts(
             }
         };
 
+        let device_path = match pushed.get(&device_id) {
+            Some(path) => path.clone(),
+            None => match push_media(cfg, &device_id, &local_path).await {
+                Ok(path) => {
+                    emit_log(
+                        app,
+                        "info",
+                        format!("pushed clip to {device_id} at {path}"),
+                    );
+                    pushed.insert(device_id.clone(), path.clone());
+                    path
+                }
+                Err(e) => {
+                    // The agent cannot post a video the phone does not have.
+                    emit_log(app, "error", format!("{platform}: {e}"));
+                    results.push(
+                        serde_json::json!({ "platform": platform, "success": false, "error": e }),
+                    );
+                    continue;
+                }
+            },
+        };
+
         let caption = build_caption(&job, platform);
-        let instruction = build_instruction(platform, &local_path_str, &caption);
+        let instruction = build_instruction(platform, &device_path, &caption);
 
         emit_log(
             app,
@@ -1753,6 +1840,35 @@ mod tests {
         });
         let job = parse_job("http://vps:3000", &body).expect("job");
         assert_eq!(job.file_url, "http://vps:3000/api/bridge/clips/u-1/file");
+    }
+
+    // ── pushing the clip onto the handset ─────────────────────
+
+    #[test]
+    fn push_response_yields_the_on_device_path() {
+        let body = r#"{"ok":true,"device_path":"/sdcard/Movies/u-1.mp4","bytes":353834}"#;
+        assert_eq!(
+            parse_push_response(body).expect("path"),
+            "/sdcard/Movies/u-1.mp4"
+        );
+    }
+
+    #[test]
+    fn push_response_without_a_path_is_an_error() {
+        // A 200 that carries no usable path must fail here. Letting it through
+        // means running an agent against an empty path and calling it a post.
+        for body in [
+            r#"{"ok":true}"#,
+            r#"{"ok":true,"device_path":""}"#,
+            r#"{"ok":true,"device_path":"   "}"#,
+            r#"{"ok":true,"device_path":null}"#,
+            "not json at all",
+        ] {
+            assert!(
+                parse_push_response(body).is_err(),
+                "expected error for {body}"
+            );
+        }
     }
 
     // ── DM rate limiting ──────────────────────────────────────
