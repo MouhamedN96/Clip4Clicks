@@ -120,13 +120,17 @@ async function main() {
         ? ok('indexed in MediaStore — visible to any app\'s gallery picker')
         : bad('pushed but not indexed; a gallery picker will not see it');
 
-    // ── 7. the agent drives the app (credit-gated) ───────────────────────────
+    // ── 7. the agent drives the app ──────────────────────────────────────────
+    // Settings, not a gallery: the google_apis emulator image ships no Photos
+    // app, so asking for one tests the image rather than the agent. This still
+    // exercises the whole capability - see the screen, decide, tap, navigate,
+    // read a value back - which is what posting needs.
     const agentRes = await fetch(`${SHIM}/devices/${DEVICE}/agent`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-            instruction: `Open the Photos app and confirm the video at ${push.device_path} is visible.`,
-            max_steps: 5
+            instruction: 'Open the Settings app, go to About phone, and report the Android version.',
+            max_steps: 15
         })
     });
     if (agentRes.ok) {

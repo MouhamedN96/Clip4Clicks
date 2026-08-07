@@ -111,3 +111,40 @@ change to what can reach the API, so make it deliberately.
   APKs or a `google_apis_playstore` image.
 - Emulators are fingerprinted by those apps. Fine for building and proving the
   pipeline; real handsets for actual posting.
+
+## Gemini setup (verified working)
+
+`.env` in the mobile-use clone (it is gitignored there):
+
+```
+GOOGLE_API_KEY=<AI Studio key>
+MOBILE_USE_TELEMETRY_ENABLED=false
+```
+
+Then `llm-config.override.jsonc` in the mobile-use root. Three traps, all of
+which present as "the key doesn't work":
+
+1. **The SDK ignores the override.** `initialize_llm_config()` merges it; the
+   CLI calls that, the SDK does not — it goes straight to the defaults. The shim
+   calls it and passes the result in as an `AgentProfile`.
+2. **A malformed override fails silently.** `utils.video_analyzer.fallback` is
+   required; omit it and `parse_llm_config` logs an error nobody sees and
+   returns the all-OpenAI defaults. Also: a node with no explicit fallback keeps
+   the *OpenAI* default fallback. Declare a fallback on every node.
+3. **`/models` lists more than the key will serve.** On a new AI Studio key,
+   `gemini-2.5-flash` and `-flash-lite` 404 with "no longer available to new
+   users", and `gemini-2.5-pro` / `gemini-2.0-flash` 429 on quota. Working:
+   `gemini-flash-latest`, `gemini-flash-lite-latest`, `gemini-3.5-flash`,
+   `gemini-3.6-flash`, `gemini-3-flash-preview`. Verify by calling, not listing.
+
+Mobile-Use also needs the `adb` **binary** on PATH — adbutils only needs the
+server socket, but `Agent.init()` shells out.
+
+### Free-tier quota is not an operating budget
+
+`GenerateRequestsPerDayPerProjectPerModel-FreeTier` is **20 requests per day,
+per model**. One posting run is 20–50 model calls, so the free tier is under one
+post per day per model. It is enough to prove the loop and nothing more.
+The quota is per *model*, so spreading roles across the five usable models
+multiplies it — still only a few runs a day. Operating this needs billing
+enabled or a local model.

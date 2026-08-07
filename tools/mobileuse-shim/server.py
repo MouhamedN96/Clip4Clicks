@@ -121,12 +121,26 @@ class DeviceWorker:
         # Imported here, not at module scope: importing the SDK pulls in the
         # whole LangGraph stack, and the ADB endpoints must stay usable even if
         # that import or its config is unhappy.
+        from minitap.mobile_use.config import initialize_llm_config
         from minitap.mobile_use.context import DevicePlatform
         from minitap.mobile_use.sdk import Agent
         from minitap.mobile_use.sdk.builders.agent_config_builder import AgentConfigBuilder
+        from minitap.mobile_use.sdk.constants import DEFAULT_PROFILE_NAME
+        from minitap.mobile_use.sdk.types.task import AgentProfile
+
+        # llm-config.override.jsonc is only merged by initialize_llm_config(),
+        # which the CLI calls and the SDK does not - the SDK defaults straight to
+        # llm-config.defaults.jsonc. Without this the override is silently
+        # ignored and every role demands OPENAI_API_KEY no matter what the
+        # override says.
+        profile = AgentProfile(name=DEFAULT_PROFILE_NAME, llm_config=initialize_llm_config())
 
         config = (
-            AgentConfigBuilder().for_device(DevicePlatform.ANDROID, self.device_id).build()
+            AgentConfigBuilder()
+            .for_device(DevicePlatform.ANDROID, self.device_id)
+            .add_profile(profile)
+            .with_default_profile(profile)
+            .build()
         )
         agent = Agent(config=config)
         await agent.init()
